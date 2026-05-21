@@ -585,14 +585,28 @@ def _ensure_current_event_loop(request):
 
 
 @pytest.fixture(autouse=True)
-def _enforce_test_timeout():
+def _enforce_test_timeout(request):
     """Kill any individual test that takes longer than 30 seconds.
-    SIGALRM is Unix-only; skip on Windows."""
+
+    Tests that legitimately need longer (docker harness, etc.) can opt
+    out by carrying an explicit ``@pytest.mark.timeout(<seconds>)`` marker
+    — we honor it instead of the default 30s. Without a marker the cap
+    stays at 30s as a safety net for hanging subprocess/I/O tests.
+    SIGALRM is Unix-only; skip on Windows.
+    """
     if sys.platform == "win32":
         yield
         return
+    marker = request.node.get_closest_marker("timeout")
+    if marker is not None and marker.args:
+        try:
+            timeout_s = int(marker.args[0])
+        except (TypeError, ValueError):
+            timeout_s = 30
+    else:
+        timeout_s = 30
     old = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(30)
+    signal.alarm(timeout_s)
     yield
     signal.alarm(0)
     signal.signal(signal.SIGALRM, old)
