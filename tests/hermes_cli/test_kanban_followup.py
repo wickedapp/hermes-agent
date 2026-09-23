@@ -676,6 +676,36 @@ def test_fresh_failure_transition_resets_old_task_stall_clock(kanban_home, kind)
     assert stalls == 0
 
 
+def test_old_queued_task_claim_resets_stall_clock(kanban_home):
+    """An old queue age must not become an immediate running-task stall."""
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, created_at=1_000, boss=False)
+        conn.execute(
+            "UPDATE tasks SET status_changed_at=? WHERE id=?", (1_000, task_id)
+        )
+        conn.commit()
+        before_claim = conn.execute(
+            "SELECT status_changed_at FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()["status_changed_at"]
+
+        claimed = kb.claim_task(conn, task_id, claimer="fresh-generation")
+        assert claimed is not None
+        after_claim = conn.execute(
+            "SELECT status_changed_at FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()["status_changed_at"]
+        assert after_claim > before_claim
+
+        followup.evaluate_tick(conn, now=after_claim)
+        fingerprint = followup.artifact_fingerprint(followup._snapshot(conn, task_id))
+        stalls = conn.execute(
+            "SELECT COUNT(*) FROM kanban_followup_outbox "
+            "WHERE milestone='90m' AND artifact_fingerprint=?",
+            (fingerprint,),
+        ).fetchone()[0]
+
+    assert stalls == 0
+
+
 @pytest.mark.parametrize(
     "artifact",
     [

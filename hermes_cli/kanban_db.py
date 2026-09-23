@@ -812,6 +812,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
+    -- Canonical product-state clock. Maintained by a database trigger so
+    -- every status writer, including dashboard/direct SQL paths, participates.
+    status_changed_at    INTEGER,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
@@ -1276,6 +1279,44 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # creation path that doesn't set the env var (CLI, dashboard).
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
+        )
+
+    if "status_changed_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "status_changed_at", "status_changed_at INTEGER"
+        )
+    # Backfill legacy rows without pretending that an upgrade itself was
+    # product progress. Future transitions are timestamped by the trigger
+    # below, regardless of which supported writer performs the UPDATE.
+    if "created_at" in cols:
+        conn.execute(
+            "UPDATE tasks SET status_changed_at = created_at "
+            "WHERE status_changed_at IS NULL"
+        )
+    if {"status", "created_at"}.issubset(cols):
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_status_changed_at_insert
+            AFTER INSERT ON tasks
+            WHEN NEW.status_changed_at IS NULL
+            BEGIN
+                UPDATE tasks
+                   SET status_changed_at = NEW.created_at
+                 WHERE id = NEW.id;
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_status_changed_at
+            AFTER UPDATE OF status ON tasks
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE tasks
+                   SET status_changed_at = CAST(strftime('%s', 'now') AS INTEGER)
+                 WHERE id = NEW.id;
+            END
+            """
         )
 
     # Indexes over additive ``tasks`` columns must be created after the

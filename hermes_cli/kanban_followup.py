@@ -28,10 +28,6 @@ _ARTIFACT_KEYS = {
 }
 _NOISY_EVENT_KINDS = {"heartbeat", "log", "comment", "claimed", "spawned"}
 _TERMINAL_STATES = {"done", "archived"}
-_STATE_EVENT_KINDS = {
-    "created", "completed", "blocked", "unblocked", "archived", "restored",
-    "crashed", "timed_out", "gave_up", "reclaimed", "stale",
-}
 _RECOVERY_EVENT_KINDS = {"crashed", "timed_out", "gave_up", "reclaimed", "stale"}
 
 
@@ -157,7 +153,7 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
     task = conn.execute(
         "SELECT id, status, consecutive_failures, current_run_id, claim_lock, "
         "worker_pid, worker_process_started_at, started_at, last_heartbeat_at, "
-        "created_at, last_failure_error, "
+        "created_at, status_changed_at, last_failure_error, "
         "claim_expires "
         "FROM tasks WHERE id = ?",
         (native_task_id,),
@@ -168,7 +164,11 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
     artifacts: dict[str, Any] = {}
     verdict = None
     transition_generation = None
-    changed_at = int(task["created_at"] or 0)
+    # Task status is product state. Its canonical clock is maintained by a
+    # SQLite trigger, rather than reconstructed from a fragile event-kind
+    # allowlist. That covers claim, promotion, specification, scheduling,
+    # direct dashboard status writes, and future transition paths uniformly.
+    changed_at = int(task["status_changed_at"] or task["created_at"] or 0)
     events = conn.execute(
         "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC",
         (native_task_id,),
@@ -177,7 +177,7 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         if event["kind"] in _NOISY_EVENT_KINDS:
             continue
         payload = _json_payload(event["payload"])
-        if event["kind"] == "followup_artifact" or event["kind"] in _STATE_EVENT_KINDS:
+        if event["kind"] == "followup_artifact" or event["kind"] in _RECOVERY_EVENT_KINDS:
             changed_at = max(changed_at, int(event["created_at"] or 0))
         if event["kind"] in _RECOVERY_EVENT_KINDS:
             transition_generation = int(event["id"])
