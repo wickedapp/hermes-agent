@@ -658,6 +658,7 @@ def _handle_create(args: dict, **kw) -> str:
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    followup_control_id = args.get("followup_control_id")
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
@@ -705,11 +706,16 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                followup_control_id=followup_control_id,
+                followup_origin_platform=args.get("followup_origin_platform"),
+                followup_origin_chat_id=args.get("followup_origin_chat_id"),
+                followup_origin_thread_id=args.get("followup_origin_thread_id"),
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                followup_control_id=followup_control_id,
             )
         finally:
             conn.close()
@@ -1134,6 +1140,26 @@ KANBAN_CREATE_SCHEMA = {
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
                 ),
+            },
+            "followup_control_id": {
+                "type": "string",
+                "description": (
+                    "Durable control-plane handle for long work. When set, "
+                    "the handle is atomically linked to the returned native task ID "
+                    "before the dispatcher can start implementation."
+                ),
+            },
+            "followup_origin_platform": {
+                "type": "string",
+                "description": "Optional originating Boss platform for milestone delivery.",
+            },
+            "followup_origin_chat_id": {
+                "type": "string",
+                "description": "Optional originating Boss chat/DM ID for milestone delivery.",
+            },
+            "followup_origin_thread_id": {
+                "type": "string",
+                "description": "Optional originating Boss thread/topic ID.",
             },
             "max_runtime_seconds": {
                 "type": "integer",

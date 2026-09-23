@@ -933,6 +933,51 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable control-plane linkage and delivery queue for long-task follow-up.
+-- ``native_task_id`` is nullable so a control item can be registered before
+-- its native worker task is known; the 15-minute SLA reports that condition.
+CREATE TABLE IF NOT EXISTS kanban_followup_links (
+    control_id       TEXT PRIMARY KEY,
+    native_task_id   TEXT,
+    origin_platform  TEXT,
+    origin_chat_id   TEXT,
+    origin_thread_id TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_followup_outbox (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    control_id           TEXT NOT NULL,
+    native_task_id       TEXT,
+    route_kind           TEXT NOT NULL,
+    route_fingerprint    TEXT NOT NULL,
+    platform             TEXT NOT NULL,
+    chat_id              TEXT NOT NULL,
+    thread_id            TEXT NOT NULL DEFAULT '',
+    milestone            TEXT NOT NULL,
+    artifact_fingerprint TEXT NOT NULL,
+    payload              TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at      INTEGER NOT NULL,
+    lease_token          TEXT,
+    lease_expires_at     INTEGER,
+    delivery_evidence    TEXT,
+    last_error           TEXT,
+    created_at           INTEGER NOT NULL,
+    delivered_at         INTEGER,
+    UNIQUE(control_id, route_fingerprint, milestone, artifact_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_followup_observations (
+    control_id           TEXT NOT NULL,
+    artifact_fingerprint TEXT NOT NULL,
+    first_seen_at        INTEGER NOT NULL,
+    last_seen_at         INTEGER NOT NULL,
+    PRIMARY KEY (control_id, artifact_fingerprint)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -942,6 +987,11 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_followup_native        ON kanban_followup_links(native_task_id);
+CREATE INDEX IF NOT EXISTS idx_followup_outbox_ready  ON kanban_followup_outbox(status, next_attempt_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_followup_terminal_once_v2
+    ON kanban_followup_outbox(control_id, route_fingerprint, artifact_fingerprint)
+    WHERE milestone = 'terminal';
 """
 
 
@@ -1411,6 +1461,10 @@ def create_task(
     max_retries: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    followup_control_id: Optional[str] = None,
+    followup_origin_platform: Optional[str] = None,
+    followup_origin_chat_id: Optional[str] = None,
+    followup_origin_thread_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -1513,6 +1567,26 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if followup_control_id:
+                now_existing = int(time.time())
+                with write_txn(conn):
+                    conn.execute(
+                        """INSERT INTO kanban_followup_links
+                           (control_id, native_task_id, origin_platform, origin_chat_id,
+                            origin_thread_id, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(control_id) DO UPDATE SET
+                             native_task_id=excluded.native_task_id,
+                             origin_platform=COALESCE(excluded.origin_platform, origin_platform),
+                             origin_chat_id=COALESCE(excluded.origin_chat_id, origin_chat_id),
+                             origin_thread_id=excluded.origin_thread_id,
+                             updated_at=excluded.updated_at""",
+                        (
+                            str(followup_control_id), row["id"], followup_origin_platform,
+                            followup_origin_chat_id, followup_origin_thread_id or "",
+                            now_existing, now_existing,
+                        ),
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -1610,6 +1684,26 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
+                if followup_control_id:
+                    conn.execute(
+                        """
+                        INSERT INTO kanban_followup_links (
+                            control_id, native_task_id, origin_platform,
+                            origin_chat_id, origin_thread_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(control_id) DO UPDATE SET
+                            native_task_id=excluded.native_task_id,
+                            origin_platform=COALESCE(excluded.origin_platform, origin_platform),
+                            origin_chat_id=COALESCE(excluded.origin_chat_id, origin_chat_id),
+                            origin_thread_id=excluded.origin_thread_id,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            str(followup_control_id), task_id,
+                            followup_origin_platform, followup_origin_chat_id,
+                            followup_origin_thread_id or "", now, now,
+                        ),
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

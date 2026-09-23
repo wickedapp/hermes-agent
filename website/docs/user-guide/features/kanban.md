@@ -52,6 +52,125 @@ They look similar; they are not the same primitive.
 
 They coexist: a kanban worker may call `delegate_task` internally during its run.
 
+## Durable AFK follow-up contract
+
+Long-running requests accepted through an AFK or Kanban intake must become a
+native Kanban task **before implementation starts**. Keep both identifiers in
+the intake record:
+
+- the control-plane intake ID, used to correlate the original request; and
+- the native task ID (`t_...`), used for execution, inspection, recovery, and
+  the final handoff.
+
+Generic delegation is control-plane assistance only. It may classify the
+request, prepare a specification, or help create the native task, but it is not
+the durable executor. A delegated child is synchronous and is cancelled when
+its parent turn is interrupted. Cron may schedule intake, but the native task,
+its run rows, and its artifacts are the delivery record.
+
+### Progress and delivery routes
+
+Report progress only when there is a durable artifact or a grounded failure:
+a saved report, diff, commit, test result, reproducible error, or terminal
+handoff. Do not turn heartbeats, model narration, or repeated "still working"
+messages into progress updates.
+
+The follow-up router uses two destinations:
+
+- Routine artifact updates go to the Telegram **Cron Status** chat,
+  `-5277676345`.
+- Milestones go back to the originating **Boss** source (its platform, chat,
+  and thread). Milestones include acceptance/linkage, a material implementation
+  artifact, a verified commit or grounded failure, a stall escalation, and the
+  terminal result.
+
+These are delivery routes, not execution ownership. The Kanban task remains
+the source of truth even if a notification is delayed or retried.
+
+### Follow-up service levels
+
+Measure these deadlines from supported intake acceptance:
+
+| Deadline | Required evidence |
+|---|---|
+| 15 minutes | The control intake is linked to a native Kanban task ID. |
+| 30 minutes | A material diff or another durable artifact exists, or a grounded failure is reported. |
+| 60 minutes | A verified commit exists, or the reported failure has been reduced to a specific reproducible cause. |
+| 90 minutes | If neither completion nor the preceding evidence exists, report the task as stalled and escalate it to the Boss origin. |
+
+An SLA update does not replace the task history. Put the artifact path, commit
+ID, verification command/result, or failure evidence on the task so recovery
+does not depend on chat history.
+
+### Durable state and single-writer fencing
+
+The board SQLite database stores tasks, runs, events, and claim locks. Internal
+`kanban_followup_links` rows correlate control and native IDs; the internal
+`kanban_followup_outbox` stores notification payloads, retry state, delivery
+evidence, and expiring delivery leases. The outbox deduplicates terminal
+delivery by artifact fingerprint. These tables are implementation state; do
+not edit them by hand or build operator automation around their schema.
+
+Never start a second worker because a notification appears late. Inspect the
+native task first. If a running worker is genuinely stuck, use the supported
+reclaim command: it terminates that worker, closes its run as reclaimed, and
+returns the task to `ready`. Wait for that fence to complete before allowing a
+replacement worker to claim the task. Run only one gateway dispatcher for a
+board; do not run the deprecated standalone daemon beside it.
+
+```bash
+# Inspect the source of truth.
+hermes kanban show <native-task-id>
+hermes kanban diagnostics --task <native-task-id>
+hermes kanban list --status running
+hermes gateway status
+
+# Fence a confirmed stuck writer and let the dispatcher retry it.
+hermes kanban reclaim <native-task-id> --reason "stalled after operator inspection"
+
+# Restart notification/dispatch processing if the gateway is unhealthy.
+hermes gateway restart
+```
+
+Do not reclaim merely because a task has crossed an SLA. A live worker can be
+slow while still holding a valid claim; use the task events, diagnostics,
+heartbeats, PID state, and artifact timestamps as evidence.
+
+### Backup and rollback
+
+Before a manual repair or version rollback, stop the gateway and take a
+consistent backup. Prefer the supported full backup, which snapshots SQLite
+through its backup API and excludes transient WAL/SHM sidecars:
+
+```bash
+hermes backup --output /safe/path/hermes-before-afk-rollback.zip
+```
+
+For a board-only forensic copy, preserve the board database together with its
+`-wal` and `-shm` files while the gateway is stopped. Never copy only a live
+`.db` file or overwrite one under a running gateway. Roll back by restoring the
+known-good database (or using `hermes import <backup.zip>` for a full Hermes
+backup), then restart the gateway and verify the task with `show` and
+`diagnostics` before dispatch resumes.
+
+### Limits, privacy, and merge authority
+
+- This contract is single-host and depends on the gateway/dispatcher being
+  supervised. It does not make generic delegation or a background terminal
+  process durable.
+- Delivery is retryable, not instantaneous or exactly-once at the messaging
+  platform. The outbox and artifact fingerprint prevent Hermes from scheduling
+  duplicate terminal sends; operators must still treat the task record as
+  authoritative.
+- Store references to secrets, not secret values. Never place API keys,
+  passwords, tokens, private user content, or unredacted sensitive logs in task
+  bodies, comments, artifacts, commits, outbox payloads, or Telegram updates.
+  Keep secrets in the supported credential/config surfaces and redact failure
+  evidence before attaching it.
+- Automation may prepare and verify a branch or commit, but **only a human may
+  approve and merge it**. A completed task or delivered milestone is not merge
+  authorization.
+
 ## Core concepts
 
 - **Board** — a standalone queue of tasks with its own SQLite DB, workspaces
