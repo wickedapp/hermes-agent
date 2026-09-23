@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_followup as followup
+from tools import kanban_tools
+
+
+STATUS_ROUTE = {
+    "platform": "telegram", "chat_id": "status-chat", "thread_id": "",
+}
 
 
 @pytest.fixture
@@ -18,6 +25,13 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    evaluate_tick = followup.evaluate_tick
+
+    def configured_tick(conn, now=None, **kwargs):
+        kwargs.setdefault("status_route", STATUS_ROUTE)
+        return evaluate_tick(conn, now=now, **kwargs)
+
+    monkeypatch.setattr(followup, "evaluate_tick", configured_tick)
     return home
 
 
@@ -73,6 +87,63 @@ def test_native_intake_atomically_persists_control_link(kanban_home):
             "SELECT route_kind FROM kanban_followup_outbox WHERE milestone='linked'"
         ).fetchall()
         assert {row["route_kind"] for row in routes} == {"status", "boss"}
+
+
+def test_model_callable_route_arguments_cannot_redirect_boss(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "spoofed-env-chat")
+    assert "followup_origin_chat_id" not in kanban_tools.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    result = json.loads(kanban_tools._handle_create({
+        "title": "untrusted route", "assignee": "worker",
+        "followup_control_id": "route-control",
+        "followup_origin_platform": "telegram",
+        "followup_origin_chat_id": "attacker-chat",
+    }))
+    with kb.connect() as conn:
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id='route-control'"
+        ).fetchone()
+    assert result["task_id"] == link["native_task_id"]
+    assert link["origin_platform"] is None
+    assert link["origin_chat_id"] is None
+
+
+def test_authenticated_origin_replays_same_route_idempotently(kanban_home):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="telegram", chat_id="boss-chat", thread_id="thread-1",
+    )
+    try:
+        args = {
+            "title": "trusted route", "assignee": "worker",
+            "followup_control_id": "trusted-control",
+        }
+        first = json.loads(kanban_tools._handle_create(args))
+        replay = json.loads(kanban_tools._handle_create(args))
+    finally:
+        clear_session_vars(tokens)
+    with kb.connect() as conn:
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id='trusted-control'"
+        ).fetchone()
+    assert first["task_id"] == replay["task_id"]
+    assert (link["origin_platform"], link["origin_chat_id"], link["origin_thread_id"]) == (
+        "telegram", "boss-chat", "thread-1",
+    )
+
+
+def test_status_route_requires_explicit_configuration(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="quiet install")
+        followup.register_link(conn, "quiet-control", task_id)
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id='quiet-control'"
+        ).fetchone()
+    assert list(followup._routes(link, "linked", None)) == []
+    assert list(followup._routes(link, "linked", STATUS_ROUTE)) == [
+        ("status", "telegram", "status-chat", ""),
+    ]
 
 
 def test_worktree_intake_always_gets_native_followup_identity(kanban_home):
@@ -301,6 +372,44 @@ def test_reused_owner_pid_alerts_without_takeover(kanban_home, monkeypatch):
     assert task_after.current_run_id == task.current_run_id
 
 
+def test_fenced_recovery_cannot_reset_replacement_owner(kanban_home, monkeypatch):
+    """A replacement published after observation survives stale recovery."""
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        kb.claim_task(conn, task_id, claimer="old-owner")
+        old = kb.get_task(conn, task_id)
+        conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=424242 WHERE id=?",
+            (old.current_run_id,),
+        )
+        conn.commit()
+        monkeypatch.setattr(os, "kill", lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
+        real_reclaim = kb.reclaim_task
+
+        def race_reclaim(db, tid, **kwargs):
+            replacement_run = db.execute(
+                "INSERT INTO task_runs (task_id,status,claim_lock,worker_pid,started_at) "
+                "VALUES (?, 'running', 'replacement', 777, 2000)",
+                (tid,),
+            ).lastrowid
+            db.execute(
+                "UPDATE tasks SET current_run_id=?, claim_lock='replacement', "
+                "worker_pid=777 WHERE id=?",
+                (replacement_run, tid),
+            )
+            db.commit()
+            return real_reclaim(db, tid, **kwargs)
+
+        monkeypatch.setattr(kb, "reclaim_task", race_reclaim)
+        followup.evaluate_tick(conn, now=1_001)
+        after = kb.get_task(conn, task_id)
+
+    assert after.status == "running"
+    assert after.claim_lock == "replacement"
+    assert after.worker_pid == 777
+
+
 @pytest.mark.parametrize("pid_error", [None, PermissionError(), OSError("opaque")])
 def test_matching_live_owner_pid_probe_is_not_a_blocker(kanban_home, monkeypatch, pid_error):
     with kb.connect() as conn:
@@ -519,3 +628,22 @@ def test_isolated_dry_run_canary_requires_positive_message_id_evidence(kanban_ho
         "status": "delivered",
         "delivery_evidence": "dry-run-message-id-1",
     }
+
+
+def test_dispatched_crash_boundary_is_not_retried(kanban_home):
+    with kb.connect() as conn:
+        _linked_task(conn, boss=False)
+        followup.evaluate_tick(conn, now=3_000)
+        item = followup.claim_pending(conn, now=3_000, limit=1)[0]
+        assert followup.mark_dispatched(
+            conn, item.id, item.lease_token, f"adapter-call:{item.idempotency_key}"
+        )
+        # Simulate process death after platform acceptance and before receipt.
+    with kb.connect() as restarted:
+        assert followup.claim_pending(restarted, now=99_999) == []
+        row = restarted.execute(
+            "SELECT status, delivery_evidence FROM kanban_followup_outbox WHERE id=?",
+            (item.id,),
+        ).fetchone()
+    assert row["status"] == "ambiguous"
+    assert item.idempotency_key in row["delivery_evidence"]

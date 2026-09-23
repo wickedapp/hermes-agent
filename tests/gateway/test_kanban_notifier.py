@@ -101,6 +101,14 @@ def test_followup_canary_delivers_status_and_boss_with_receipts(tmp_path, monkey
     db_path = tmp_path / "followup-canary.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
+    from hermes_cli import config as hermes_config
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"kanban": {"followup_status_route": {
+            "platform": "telegram", "chat_id": "status-chat",
+        }}},
+    )
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="canary", workspace_kind="worktree",
@@ -122,7 +130,7 @@ def test_followup_canary_delivers_status_and_boss_with_receipts(tmp_path, monkey
     asyncio.run(runner._kanban_followup_tick())
 
     assert {item["chat_id"] for item in adapter.sent} == {
-        "-5277676345", "boss-chat",
+        "status-chat", "boss-chat",
     }
     assert all("canary-head" in item["text"] for item in adapter.sent)
     assert all("verdict=PASS" in item["text"] for item in adapter.sent)
@@ -135,6 +143,43 @@ def test_followup_canary_delivers_status_and_boss_with_receipts(tmp_path, monkey
     assert {row["delivery_evidence"] for row in receipts} == {
         "receipt-1", "receipt-2",
     }
+
+
+class SuccessWithoutMessageIdAdapter(RecordingAdapter):
+    async def send(self, chat_id, text, metadata=None):
+        await super().send(chat_id, text, metadata=metadata)
+        return SimpleNamespace(success=True, message_id=None)
+
+
+def test_followup_success_without_message_id_is_finalized(tmp_path, monkeypatch):
+    db_path = tmp_path / "followup-no-message-id.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="canary")
+        from hermes_cli import kanban_followup as followup
+        followup.register_link(
+            conn, "control", tid, origin_platform="telegram",
+            origin_chat_id="boss-chat",
+        )
+        kb.complete_task(conn, tid, result="done")
+
+    adapter = SuccessWithoutMessageIdAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(runner._kanban_followup_tick())
+    asyncio.run(runner._kanban_followup_tick())
+
+    # Acceptance/link and terminal are separate high-value milestones.
+    assert len(adapter.sent) == 2
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT status, delivery_evidence FROM kanban_followup_outbox"
+        ).fetchall()
+    assert {row["status"] for row in rows} == {"delivered"}
+    assert all(
+        row["delivery_evidence"].startswith("adapter-success:no-message-id:")
+        for row in rows
+    )
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

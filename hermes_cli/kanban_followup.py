@@ -21,8 +21,6 @@ from typing import Any, Iterable, Optional
 from hermes_cli.kanban_db import write_txn
 
 
-STATUS_PLATFORM = "telegram"
-STATUS_CHAT_ID = "-5277676345"
 SLA_SECONDS = {"15m": 15 * 60, "30m": 30 * 60, "60m": 60 * 60, "90m": 90 * 60}
 _ARTIFACT_KEYS = {
     "head", "head_sha", "commit_sha", "pr_url", "artifact", "artifacts",
@@ -299,8 +297,17 @@ def _milestones(snapshot: dict[str, Any], age: int, unchanged_age: int) -> Itera
         yield "blocker"
 
 
-def _routes(link: sqlite3.Row, milestone: str) -> Iterable[tuple[str, str, str, str]]:
-    yield "status", STATUS_PLATFORM, STATUS_CHAT_ID, ""
+def _routes(
+    link: sqlite3.Row,
+    milestone: str,
+    status_route: Optional[dict[str, Any]],
+) -> Iterable[tuple[str, str, str, str]]:
+    route = status_route or {}
+    if route.get("platform") and route.get("chat_id"):
+        yield (
+            "status", str(route["platform"]), str(route["chat_id"]),
+            str(route.get("thread_id") or ""),
+        )
     boss_milestones = {"linked", "new_head", "verdict", "deployment", "90m", "blocker", "terminal"}
     if milestone in boss_milestones and link["origin_platform"] and link["origin_chat_id"]:
         yield (
@@ -309,12 +316,17 @@ def _routes(link: sqlite3.Row, milestone: str) -> Iterable[tuple[str, str, str, 
         )
 
 
-def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
+def evaluate_tick(
+    conn: sqlite3.Connection,
+    now: Optional[int] = None,
+    *,
+    status_route: Optional[dict[str, Any]] = None,
+) -> int:
     """Materialize all currently due alerts into the outbox atomically."""
     timestamp = int(time.time()) if now is None else int(now)
     links = conn.execute("SELECT * FROM kanban_followup_links ORDER BY created_at").fetchall()
     inserted = 0
-    safe_recoveries: list[tuple[str, str]] = []
+    safe_recoveries: list[tuple[str, str, int, str, int, int]] = []
     with write_txn(conn):
         for link in links:
             snapshot = _snapshot(conn, link["native_task_id"])
@@ -345,7 +357,18 @@ def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
             ).fetchone()
             unchanged_age = max(0, timestamp - int(observed["first_seen_at"]))
             if snapshot.get("owner_issue") in {"dead_owner", "missing_owner"}:
-                safe_recoveries.append((str(link["native_task_id"]), snapshot["owner_issue"]))
+                owner = conn.execute(
+                    "SELECT t.current_run_id, t.claim_lock, t.worker_pid, r.started_at "
+                    "FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+                    "WHERE t.id=? AND t.status='running'",
+                    (link["native_task_id"],),
+                ).fetchone()
+                if owner is not None:
+                    safe_recoveries.append((
+                        str(link["native_task_id"]), snapshot["owner_issue"],
+                        int(owner["current_run_id"]), str(owner["claim_lock"] or ""),
+                        int(owner["worker_pid"] or 0), int(owner["started_at"] or 0),
+                    ))
             for milestone in _milestones(snapshot, age, unchanged_age):
                 # Link acceptance has one immutable semantic generation. All
                 # other milestones, including terminal delivery, bind to the
@@ -363,7 +386,9 @@ def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
                     "fingerprint": fingerprint,
                     "snapshot": snapshot,
                 }
-                for route_kind, platform, chat_id, thread_id in _routes(link, milestone):
+                for route_kind, platform, chat_id, thread_id in _routes(
+                    link, milestone, status_route,
+                ):
                     route_fingerprint = hashlib.sha256(
                         f"{route_kind}\0{platform}\0{chat_id}\0{thread_id}".encode("utf-8")
                     ).hexdigest()
@@ -394,9 +419,13 @@ def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
         def _already_absent(_pid: int, _signal: int) -> None:
             raise ProcessLookupError
 
-        for task_id, reason in safe_recoveries:
+        for task_id, reason, run_id, claim_lock, worker_pid, started_at in safe_recoveries:
             _kb.reclaim_task(
                 conn, task_id, reason=f"followup fenced recovery: {reason}",
+                expected_run_id=run_id,
+                expected_claim_lock=claim_lock,
+                expected_worker_pid=worker_pid or None,
+                expected_started_at=started_at,
                 # Absence was established above. Do not signal the numeric PID
                 # again after the transaction boundary: the OS could reuse it
                 # for an unrelated process in that tiny interval.
@@ -467,8 +496,31 @@ def mark_delivered(
         cur = conn.execute(
             "UPDATE kanban_followup_outbox SET status='delivered', delivered_at=?, "
             "delivery_evidence=?, lease_token=NULL, lease_expires_at=NULL "
-            "WHERE id=? AND status='pending' AND lease_token=?",
+            "WHERE id=? AND status IN ('pending', 'ambiguous') AND lease_token=?",
             (timestamp, str(evidence), int(outbox_id), lease_token),
+        )
+    return cur.rowcount == 1
+
+
+def mark_dispatched(
+    conn: sqlite3.Connection,
+    outbox_id: int,
+    lease_token: str,
+    evidence: str,
+) -> bool:
+    """Persist the adapter-call crash boundary before external delivery.
+
+    Once this commits the row is deliberately not retryable.  A crash or
+    exception after the adapter is invoked is ambiguous and fails closed,
+    avoiding a blind duplicate on adapters without reconciliation support.
+    """
+    if not str(evidence or "").strip():
+        raise ValueError("dispatch evidence is required")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_followup_outbox SET status='ambiguous', "
+            "delivery_evidence=? WHERE id=? AND status='pending' AND lease_token=?",
+            (str(evidence), int(outbox_id), lease_token),
         )
     return cur.rowcount == 1
 

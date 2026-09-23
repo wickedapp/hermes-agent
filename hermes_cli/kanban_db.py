@@ -2681,6 +2681,10 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_pid: Optional[int] = None,
+    expected_started_at: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -2694,7 +2698,8 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT t.status, t.claim_lock, t.worker_pid, t.current_run_id, r.started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -2702,20 +2707,36 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if expected_run_id is not None and int(row["current_run_id"] or 0) != int(expected_run_id):
+        return False
+    if expected_claim_lock is not None and str(row["claim_lock"] or "") != expected_claim_lock:
+        return False
+    if expected_worker_pid is not None and int(row["worker_pid"] or 0) != int(expected_worker_pid):
+        return False
+    if expected_started_at is not None and int(row["started_at"] or 0) != int(expected_started_at):
+        return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ? AND worker_pid IS ? "
+            "AND (current_run_id IS NULL OR EXISTS (SELECT 1 FROM task_runs r "
+            "WHERE r.id=tasks.current_run_id AND r.started_at IS ?))",
+            (
+                task_id, prev_lock, row["current_run_id"], row["worker_pid"],
+                row["started_at"],
+            ),
         )
         if cur.rowcount != 1:
             return False
+        # Signal only after the complete owner tuple won the CAS while the
+        # write transaction excludes a replacement claim. Otherwise a new
+        # owner published between observation and reclaim could be killed.
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",

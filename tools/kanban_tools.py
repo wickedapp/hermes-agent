@@ -659,6 +659,19 @@ def _handle_create(args: dict, **kw) -> str:
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
     followup_control_id = args.get("followup_control_id")
+    # Notification destinations are authenticated gateway context, not model
+    # input.  Keeping them out of the tool schema prevents a prompt from
+    # redirecting milestones to an arbitrary chat.
+    try:
+        from gateway.session_context import get_authenticated_origin
+        authenticated_origin = get_authenticated_origin()
+        followup_origin_platform = authenticated_origin.get("platform") or None
+        followup_origin_chat_id = authenticated_origin.get("chat_id") or None
+        followup_origin_thread_id = authenticated_origin.get("thread_id") or None
+    except (ImportError, RuntimeError):
+        followup_origin_platform = None
+        followup_origin_chat_id = None
+        followup_origin_thread_id = None
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
@@ -707,9 +720,9 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 followup_control_id=followup_control_id,
-                followup_origin_platform=args.get("followup_origin_platform"),
-                followup_origin_chat_id=args.get("followup_origin_chat_id"),
-                followup_origin_thread_id=args.get("followup_origin_thread_id"),
+                followup_origin_platform=followup_origin_platform,
+                followup_origin_chat_id=followup_origin_chat_id,
+                followup_origin_thread_id=followup_origin_thread_id,
             )
             new_task = kb.get_task(conn, new_tid)
             followup_link = conn.execute(
@@ -1155,18 +1168,6 @@ KANBAN_CREATE_SCHEMA = {
                     "the handle is atomically linked to the returned native task ID "
                     "before the dispatcher can start implementation."
                 ),
-            },
-            "followup_origin_platform": {
-                "type": "string",
-                "description": "Optional originating Boss platform for milestone delivery.",
-            },
-            "followup_origin_chat_id": {
-                "type": "string",
-                "description": "Optional originating Boss chat/DM ID for milestone delivery.",
-            },
-            "followup_origin_thread_id": {
-                "type": "string",
-                "description": "Optional originating Boss thread/topic ID.",
             },
             "max_runtime_seconds": {
                 "type": "integer",

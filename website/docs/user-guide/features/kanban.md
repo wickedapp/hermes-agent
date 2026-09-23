@@ -82,10 +82,12 @@ a saved report, diff, commit, test result, reproducible error, or terminal
 handoff. Do not turn heartbeats, model narration, or repeated "still working"
 messages into progress updates.
 
-The follow-up router uses two destinations:
+The follow-up router uses two explicitly authorized destinations:
 
-- Routine artifact updates go to the Telegram **Cron Status** chat,
-  `-5277676345`.
+- Routine artifact updates go to the install's configured status route. Set
+  `kanban.followup_status_route.platform`, `.chat_id`, and optionally
+  `.thread_id` in `config.yaml`. No destination is assumed; unconfigured and
+  non-Telegram installs stay quiet.
 - Milestones go back to the originating **Boss** source (its platform, chat,
   and thread). Milestones include acceptance/linkage, a material implementation
   artifact, a verified commit or grounded failure, a stall escalation, and the
@@ -137,6 +139,14 @@ PID is provably absent. A mismatched generation, reused PID, remote owner, or
 ambiguous owner is never taken over automatically; it produces one blocker
 milestone with the task/run identity for operator inspection.
 
+Adapter dispatch is fail-closed at the crash boundary. The outbox is marked
+`ambiguous` before calling an adapter; if Hermes crashes after the platform
+accepts a message but before the receipt write, it does not blindly retry.
+Adapters that return `success=True` without a message ID are finalized with a
+stable local acceptance receipt. Operators may inspect ambiguous rows and
+reconcile them with platform history using the logged `delivery_key`; automatic
+replay requires an adapter-supported idempotency or reconciliation primitive.
+
 ```bash
 # Inspect the source of truth.
 hermes kanban show <native-task-id>
@@ -177,10 +187,11 @@ backup), then restart the gateway and verify the task with `show` and
 - This contract is single-host and depends on the gateway/dispatcher being
   supervised. It does not make generic delegation or a background terminal
   process durable.
-- Delivery is retryable, not instantaneous or exactly-once at the messaging
-  platform. The outbox and artifact fingerprint prevent Hermes from scheduling
-  duplicate terminal sends; operators must still treat the task record as
-  authoritative.
+- Delivery is retryable only before adapter dispatch and is not instantaneous
+  or exactly-once at the messaging platform. After dispatch begins, ambiguous
+  outcomes fail closed and require operator reconciliation. The outbox and
+  artifact fingerprint prevent Hermes from scheduling duplicate terminal
+  sends; operators must still treat the task record as authoritative.
 - Store references to secrets, not secret values. Never place API keys,
   passwords, tokens, private user content, or unredacted sensitive logs in task
   bodies, comments, artifacts, commits, outbox payloads, or Telegram updates.

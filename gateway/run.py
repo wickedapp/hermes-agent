@@ -4841,6 +4841,14 @@ class GatewayRunner:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_followup as _followup
 
+        try:
+            from hermes_cli.config import load_config as _load_config
+            _route = ((_load_config() or {}).get("kanban") or {}).get(
+                "followup_status_route"
+            ) or None
+        except Exception:
+            _route = None
+
         def _collect_followups():
             claimed: list[tuple[str, Any]] = []
             try:
@@ -4864,7 +4872,7 @@ class GatewayRunner:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    _followup.evaluate_tick(conn)
+                    _followup.evaluate_tick(conn, status_route=_route)
                     claimed.extend(
                         (slug, item) for item in _followup.claim_pending(conn, limit=1)
                     )
@@ -4929,22 +4937,46 @@ class GatewayRunner:
             if item.thread_id:
                 metadata["thread_id"] = item.thread_id
             try:
+                dispatched = await asyncio.to_thread(
+                    self._kanban_followup_dispatched,
+                    board_slug,
+                    item,
+                    f"adapter-call:{item.idempotency_key}",
+                )
+                if not dispatched:
+                    continue
                 result = await adapter.send(item.chat_id, message, metadata=metadata)
                 message_id = getattr(result, "message_id", None) if result is not None else None
                 success = bool(result is not None and getattr(result, "success", False))
-                if not success or not message_id:
+                if not success:
                     error = getattr(result, "error", None) if result is not None else None
-                    raise RuntimeError(error or "send returned no delivery evidence/message id")
+                    raise RuntimeError(error or "send was not accepted")
+                evidence = str(message_id) if message_id else (
+                    f"adapter-success:no-message-id:{item.idempotency_key}"
+                )
                 await asyncio.to_thread(
                     self._kanban_followup_delivered,
                     board_slug,
                     item,
-                    str(message_id),
+                    evidence,
                 )
             except Exception as exc:
-                await asyncio.to_thread(
-                    self._kanban_followup_failed, board_slug, item, str(exc),
+                logger.warning(
+                    "kanban follow-up delivery ambiguous after adapter dispatch "
+                    "(key=%s): %s", item.idempotency_key, exc,
                 )
+
+    @staticmethod
+    def _kanban_followup_dispatched(board: str, item: Any, evidence: str) -> bool:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_followup as _followup
+        conn = _kb.connect(board=board)
+        try:
+            return _followup.mark_dispatched(
+                conn, item.id, item.lease_token, evidence,
+            )
+        finally:
+            conn.close()
 
     @staticmethod
     def _kanban_followup_delivered(board: str, item: Any, evidence: str) -> None:
