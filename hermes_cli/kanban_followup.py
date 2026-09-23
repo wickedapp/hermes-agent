@@ -29,7 +29,10 @@ _ARTIFACT_KEYS = {
     "verdict", "canary", "deployment", "evidence_url", "evidence_path",
 }
 _NOISY_EVENT_KINDS = {"heartbeat", "log", "comment", "claimed", "spawned"}
-_TERMINAL_STATES = {"done", "archived", "blocked"}
+_TERMINAL_STATES = {"done", "archived"}
+_STATE_EVENT_KINDS = {
+    "created", "completed", "blocked", "unblocked", "archived", "restored",
+}
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,30 @@ def register_link(
     """Persist a generic control-id to native-task link and its Boss route."""
     now = int(time.time()) if created_at is None else int(created_at)
     with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id=?",
+            (str(control_id),),
+        ).fetchone()
+        if (
+            existing is not None
+            and existing["native_task_id"] not in (None, native_task_id)
+            and native_task_id is not None
+        ):
+            raise ValueError(
+                f"control id {control_id!r} is already linked to "
+                f"{existing['native_task_id']!r}"
+            )
+        if existing is not None:
+            for label, stored, requested in (
+                ("platform", existing["origin_platform"], origin_platform),
+                ("chat", existing["origin_chat_id"], origin_chat_id),
+                ("thread", existing["origin_thread_id"] or "", origin_thread_id or ""),
+            ):
+                if stored not in (None, "") and requested not in (None, "", stored):
+                    raise ValueError(
+                        f"control id {control_id!r} already has a different Boss "
+                        f"{label}; route changes require an explicit operator repair"
+                    )
         conn.execute(
             """
             INSERT INTO kanban_followup_links (
@@ -74,10 +101,13 @@ def register_link(
                 origin_thread_id, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(control_id) DO UPDATE SET
-                native_task_id=excluded.native_task_id,
-                origin_platform=COALESCE(excluded.origin_platform, origin_platform),
-                origin_chat_id=COALESCE(excluded.origin_chat_id, origin_chat_id),
-                origin_thread_id=excluded.origin_thread_id,
+                native_task_id=COALESCE(native_task_id, excluded.native_task_id),
+                origin_platform=COALESCE(origin_platform, excluded.origin_platform),
+                origin_chat_id=COALESCE(origin_chat_id, excluded.origin_chat_id),
+                origin_thread_id=CASE
+                    WHEN excluded.origin_thread_id != '' THEN excluded.origin_thread_id
+                    ELSE origin_thread_id
+                END,
                 updated_at=excluded.updated_at
             """,
             (
@@ -126,7 +156,9 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         return {"native_task_id": None, "state": "unlinked", "failure_count": 0}
     task = conn.execute(
         "SELECT id, status, consecutive_failures, current_run_id, claim_lock, "
-        "worker_pid, started_at, last_heartbeat_at, created_at FROM tasks WHERE id = ?",
+        "worker_pid, started_at, last_heartbeat_at, created_at, last_failure_error, "
+        "claim_expires "
+        "FROM tasks WHERE id = ?",
         (native_task_id,),
     ).fetchone()
     if task is None:
@@ -142,8 +174,9 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
     for event in events:
         if event["kind"] in _NOISY_EVENT_KINDS:
             continue
-        changed_at = max(changed_at, int(event["created_at"] or 0))
         payload = _json_payload(event["payload"])
+        if event["kind"] == "followup_artifact" or event["kind"] in _STATE_EVENT_KINDS:
+            changed_at = max(changed_at, int(event["created_at"] or 0))
         for key in _ARTIFACT_KEYS:
             if key in payload and payload[key] not in (None, "", []):
                 artifacts[key] = payload[key]
@@ -155,6 +188,7 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         "native_task_id": native_task_id,
         "state": task["status"],
         "failure_count": int(task["consecutive_failures"] or 0),
+        "failure_evidence": bool(str(task["last_failure_error"] or "").strip()),
         "artifacts": artifacts,
         "verdict": verdict,
         "owner_issue": owner_issue,
@@ -169,7 +203,8 @@ def _owner_issue(conn: sqlite3.Connection, task: sqlite3.Row) -> Optional[str]:
     if run_id is None:
         return "missing_generation"
     run = conn.execute(
-        "SELECT id, status, claim_lock, worker_pid FROM task_runs WHERE id = ? AND task_id = ?",
+        "SELECT id, status, claim_lock, worker_pid, started_at FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
         (run_id, task["id"]),
     ).fetchone()
     if run is None:
@@ -178,14 +213,36 @@ def _owner_issue(conn: sqlite3.Connection, task: sqlite3.Row) -> Optional[str]:
         return "stale_generation"
     if run["claim_lock"] != task["claim_lock"] or run["worker_pid"] != task["worker_pid"]:
         return "mismatched_owner"
+    lock = str(task["claim_lock"] or "")
+    local_prefix = f"{socket.gethostname()}:"
+    if ":" in lock and not lock.startswith(local_prefix):
+        if task["claim_expires"] and int(task["claim_expires"]) < int(time.time()):
+            return "delegation_owner_loss"
+        return None
     pid = task["worker_pid"]
     if not pid:
+        # Claim and process spawn are separate fenced writes. Give the
+        # dispatcher a short window to publish the worker PID so the watcher
+        # cannot reclaim a legitimate just-claimed generation mid-spawn.
+        if int(time.time()) - int(run["started_at"] or 0) < 60:
+            return None
         return "missing_owner"
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
         return "dead_owner"
     except (PermissionError, OSError):
+        pass
+    try:
+        import psutil  # type: ignore
+        # A live numeric PID is not proof that it is still our worker. If the
+        # OS reused it after the recorded run began, recovery must stop rather
+        # than signal an unrelated process.
+        if psutil.Process(int(pid)).create_time() > float(run["started_at"] or 0) + 2:
+            return "reused_owner_pid"
+    except ImportError:
+        pass
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
         pass
     return None
 
@@ -209,27 +266,28 @@ def artifact_fingerprint(snapshot: dict[str, Any]) -> str:
 def _milestones(snapshot: dict[str, Any], age: int, unchanged_age: int) -> Iterable[str]:
     state = snapshot["state"]
     artifacts = snapshot.get("artifacts") or {}
-    failures = int(snapshot.get("failure_count") or 0)
     if state not in {"unlinked", "missing"}:
         yield "linked"
     if state in _TERMINAL_STATES:
         yield "terminal"
         return
+    if state == "blocked":
+        yield "blocker"
     if age >= SLA_SECONDS["15m"] and state in {"unlinked", "missing"}:
         yield "15m"
-    has_diff = bool(
-        artifacts.get("head") or artifacts.get("head_sha")
-        or artifacts.get("commit_sha") or artifacts.get("pr_url")
-        or artifacts.get("artifact") or artifacts.get("artifacts")
-    )
-    if age >= SLA_SECONDS["30m"] and (not has_diff or failures):
+    has_material_artifact = bool(artifacts or snapshot.get("verdict"))
+    grounded_failure = bool(snapshot.get("failure_evidence"))
+    if age >= SLA_SECONDS["30m"] and not (has_material_artifact or grounded_failure):
         yield "30m"
     verified = bool(
         artifacts.get("commit_sha") or artifacts.get("head_sha") or artifacts.get("head")
     ) and bool(snapshot.get("verdict") or artifacts.get("verdict") or artifacts.get("canary"))
-    if age >= SLA_SECONDS["60m"] and (not verified or failures):
+    if age >= SLA_SECONDS["60m"] and not (verified or grounded_failure):
         yield "60m"
-    if unchanged_age >= SLA_SECONDS["90m"] and not has_diff and not failures:
+    # A stale diff is not progress forever. Every new durable artifact/state
+    # creates a new observation generation; 90 minutes without another one is
+    # a stall regardless of how much evidence the previous generation held.
+    if unchanged_age >= SLA_SECONDS["90m"]:
         yield "90m"
     if artifacts.get("head") or artifacts.get("head_sha") or artifacts.get("commit_sha") or artifacts.get("pr_url"):
         yield "new_head"
@@ -256,12 +314,20 @@ def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
     timestamp = int(time.time()) if now is None else int(now)
     links = conn.execute("SELECT * FROM kanban_followup_links ORDER BY created_at").fetchall()
     inserted = 0
+    safe_recoveries: list[tuple[str, str]] = []
     with write_txn(conn):
         for link in links:
             snapshot = _snapshot(conn, link["native_task_id"])
             fingerprint = artifact_fingerprint(snapshot)
             age = max(0, timestamp - int(link["created_at"]))
-            first_seen = int(snapshot.get("changed_at") or link["created_at"] or timestamp)
+            # Clamp producer timestamps to evaluator time. This tolerates
+            # clock skew between a worker and gateway and keeps replay tests
+            # deterministic without allowing a future timestamp to postpone
+            # an SLA indefinitely.
+            first_seen = min(
+                timestamp,
+                int(snapshot.get("changed_at") or link["created_at"] or timestamp),
+            )
             conn.execute(
                 """
                 INSERT INTO kanban_followup_observations (
@@ -278,18 +344,17 @@ def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
                 (link["control_id"], fingerprint),
             ).fetchone()
             unchanged_age = max(0, timestamp - int(observed["first_seen_at"]))
+            if snapshot.get("owner_issue") in {"dead_owner", "missing_owner"}:
+                safe_recoveries.append((str(link["native_task_id"]), snapshot["owner_issue"]))
             for milestone in _milestones(snapshot, age, unchanged_age):
-                # Link acceptance and terminal outcomes have immutable semantic
-                # generations. Later artifact enrichment must not replay them;
-                # a reopened/different terminal state intentionally may.
+                # Link acceptance has one immutable semantic generation. All
+                # other milestones, including terminal delivery, bind to the
+                # exact durable artifact/state/verdict fingerprint. A reopened
+                # task or later HEAD is therefore a distinct generation.
                 milestone_fingerprint = fingerprint
                 if milestone == "linked":
                     milestone_fingerprint = hashlib.sha256(
                         f"linked\0{link['native_task_id']}".encode("utf-8")
-                    ).hexdigest()
-                elif milestone == "terminal":
-                    milestone_fingerprint = hashlib.sha256(
-                        f"terminal\0{link['native_task_id']}\0{snapshot['state']}".encode("utf-8")
                     ).hexdigest()
                 payload = {
                     "control_id": link["control_id"],
@@ -319,6 +384,24 @@ def evaluate_tick(conn: sqlite3.Connection, now: Optional[int] = None) -> int:
                         ),
                     )
                     inserted += int(cur.rowcount or 0)
+    # Use the board's existing claim-lock CAS and run-closing recovery path.
+    # This happens only after the blocker alert is durable, and only for
+    # locally provable worker absence. Mismatch, PID reuse, remote ownership,
+    # and stale generations remain explicit blockers and never auto-take over.
+    if safe_recoveries:
+        from hermes_cli import kanban_db as _kb
+
+        def _already_absent(_pid: int, _signal: int) -> None:
+            raise ProcessLookupError
+
+        for task_id, reason in safe_recoveries:
+            _kb.reclaim_task(
+                conn, task_id, reason=f"followup fenced recovery: {reason}",
+                # Absence was established above. Do not signal the numeric PID
+                # again after the transaction boundary: the OS could reuse it
+                # for an unrelated process in that tiny interval.
+                signal_fn=_already_absent,
+            )
     return inserted
 
 

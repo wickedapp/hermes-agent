@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,12 @@ class RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+
+class ReceiptAdapter(RecordingAdapter):
+    async def send(self, chat_id, text, metadata=None):
+        await super().send(chat_id, text, metadata=metadata)
+        return SimpleNamespace(success=True, message_id=f"receipt-{len(self.sent)}")
 
 
 class DisconnectedAdapters(dict):
@@ -87,6 +94,47 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert len(adapter.sent) == 1
     assert "Kanban" in adapter.sent[0]["text"]
     assert tid in adapter.sent[0]["text"]
+
+
+def test_followup_canary_delivers_status_and_boss_with_receipts(tmp_path, monkeypatch):
+    """Isolated transport dry-run from native artifact to both durable routes."""
+    db_path = tmp_path / "followup-canary.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="canary", workspace_kind="worktree",
+            followup_control_id="canary-control",
+            followup_origin_platform="telegram",
+            followup_origin_chat_id="boss-chat",
+        )
+        assert kb.complete_task(
+            conn, tid, result="reviewed", metadata={
+                "head_sha": "canary-head", "verdict": "PASS",
+                "evidence_path": "/evidence/canary.json",
+            },
+        )
+
+    adapter = ReceiptAdapter()
+    runner = _make_runner(adapter)
+    # The production drain intentionally claims one row per board/tick.
+    asyncio.run(runner._kanban_followup_tick())
+    asyncio.run(runner._kanban_followup_tick())
+
+    assert {item["chat_id"] for item in adapter.sent} == {
+        "-5277676345", "boss-chat",
+    }
+    assert all("canary-head" in item["text"] for item in adapter.sent)
+    assert all("verdict=PASS" in item["text"] for item in adapter.sent)
+    assert len({item["metadata"]["idempotency_key"] for item in adapter.sent}) == 2
+    with kb.connect() as conn:
+        receipts = conn.execute(
+            "SELECT delivery_evidence FROM kanban_followup_outbox "
+            "WHERE status='delivered' ORDER BY id"
+        ).fetchall()
+    assert {row["delivery_evidence"] for row in receipts} == {
+        "receipt-1", "receipt-2",
+    }
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

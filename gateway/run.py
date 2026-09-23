@@ -4895,15 +4895,30 @@ class GatewayRunner:
 
             snapshot = item.payload.get("snapshot") or {}
             state = snapshot.get("state") or "unknown"
-            outcome = "DONE" if state in {"done", "archived"} else "NOT DONE"
+            if item.milestone == "terminal":
+                outcome = "DONE" if state in {"done", "archived"} else "NOT DONE"
+            elif item.milestone == "90m":
+                outcome = "STALLED"
+            elif item.milestone == "blocker":
+                outcome = "NEEDS ATTENTION"
+            else:
+                outcome = "IN PROGRESS"
             failures = int(snapshot.get("failure_count") or 0)
             owner_issue = snapshot.get("owner_issue")
             evidence = snapshot.get("artifacts") or {}
             detail = f"; owner={owner_issue}" if owner_issue else ""
-            if snapshot.get("verdict") not in (None, ""):
-                detail += f"; verdict={snapshot['verdict']}"
+            verdict = snapshot.get("verdict") or evidence.get("verdict")
+            if item.milestone == "terminal" and not verdict:
+                verdict = "PASS" if state in {"done", "archived"} else "FAIL"
+            if verdict not in (None, ""):
+                detail += f"; verdict={verdict}"
             if evidence:
                 detail += f"; evidence={json.dumps(evidence, sort_keys=True, default=str)[:500]}"
+            elif item.milestone == "terminal":
+                # A native task transition is itself the fallback durable
+                # artifact. This keeps terminal reports inspectable even when
+                # a non-git task has no commit or file path.
+                detail += f"; evidence=kanban-task:{item.native_task_id}"
             message = (
                 f"Kanban follow-up [{item.milestone}] {item.control_id}"
                 f" -> {item.native_task_id or 'unlinked'}: {outcome}; "

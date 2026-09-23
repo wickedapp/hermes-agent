@@ -75,12 +75,128 @@ def test_native_intake_atomically_persists_control_link(kanban_home):
         assert {row["route_kind"] for row in routes} == {"status", "boss"}
 
 
+def test_worktree_intake_always_gets_native_followup_identity(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="software delivery", workspace_kind="worktree",
+            workspace_path="/tmp/repo",
+        )
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE native_task_id=?", (task_id,)
+        ).fetchone()
+
+    assert link["control_id"] == f"native:{task_id}"
+
+
+def test_control_id_retry_keeps_native_task_and_boss_thread(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn, title="first", workspace_kind="worktree",
+            followup_control_id="intake-1", followup_origin_platform="telegram",
+            followup_origin_chat_id="boss", followup_origin_thread_id="thread-1",
+        )
+        retried = kb.create_task(
+            conn, title="retry", workspace_kind="worktree",
+            followup_control_id="intake-1", followup_origin_platform="telegram",
+            followup_origin_chat_id="boss",
+        )
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id='intake-1'"
+        ).fetchone()
+
+    assert retried == first
+    assert link["native_task_id"] == first
+    assert link["origin_thread_id"] == "thread-1"
+
+
+def test_control_id_retry_cannot_redirect_boss_route(kanban_home):
+    with kb.connect() as conn:
+        kb.create_task(
+            conn, title="first", workspace_kind="worktree",
+            followup_control_id="intake-1", followup_origin_platform="telegram",
+            followup_origin_chat_id="boss-a", followup_origin_thread_id="thread-a",
+        )
+        with pytest.raises(ValueError, match="different Boss chat"):
+            kb.create_task(
+                conn, title="redirect", workspace_kind="worktree",
+                followup_control_id="intake-1", followup_origin_platform="telegram",
+                followup_origin_chat_id="boss-b", followup_origin_thread_id="thread-a",
+            )
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id='intake-1'"
+        ).fetchone()
+
+    assert link["origin_chat_id"] == "boss-a"
+
+
+def test_stale_control_link_fails_closed_without_second_writer(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="first", workspace_kind="worktree",
+            followup_control_id="intake-1",
+        )
+        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        conn.commit()
+        with pytest.raises(ValueError, match="references missing native task"):
+            kb.create_task(
+                conn, title="retry", workspace_kind="worktree",
+                followup_control_id="intake-1",
+            )
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    assert task_count == 0
+
+
+def test_idempotent_native_retry_cannot_redirect_boss_thread(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="first", workspace_kind="worktree",
+            idempotency_key="delivery-1", followup_origin_platform="telegram",
+            followup_origin_chat_id="boss-a", followup_origin_thread_id="thread-a",
+        )
+        with pytest.raises(ValueError, match="different Boss thread"):
+            kb.create_task(
+                conn, title="retry", workspace_kind="worktree",
+                idempotency_key="delivery-1", followup_origin_platform="telegram",
+                followup_origin_chat_id="boss-a", followup_origin_thread_id="thread-b",
+            )
+        link = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE native_task_id=?", (task_id,)
+        ).fetchone()
+
+    assert link["origin_thread_id"] == "thread-a"
+
+
+def test_register_link_replay_cannot_erase_native_task(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="native")
+        followup.register_link(conn, "control-1", task_id)
+        followup.register_link(conn, "control-1", None)
+        link = conn.execute(
+            "SELECT native_task_id FROM kanban_followup_links WHERE control_id='control-1'"
+        ).fetchone()
+
+    assert link["native_task_id"] == task_id
+
+
+def test_register_link_can_fill_initially_unlinked_control(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="native")
+        followup.register_link(conn, "control-1", None)
+        followup.register_link(conn, "control-1", task_id)
+        link = conn.execute(
+            "SELECT native_task_id FROM kanban_followup_links WHERE control_id='control-1'"
+        ).fetchone()
+
+    assert link["native_task_id"] == task_id
+
+
 def test_pending_delivery_survives_restart_and_expired_lease(kanban_home):
     with kb.connect() as conn:
         _linked_task(conn, boss=False)
-        assert followup.evaluate_tick(conn, now=7_000) == 2
+        assert followup.evaluate_tick(conn, now=7_000) == 3
         first_claim = followup.claim_pending(conn, now=7_000, lease_seconds=10)
-        assert len(first_claim) == 2
+        assert len(first_claim) == 3
 
     with kb.connect() as restarted:
         assert followup.claim_pending(restarted, now=7_009) == []
@@ -88,6 +204,9 @@ def test_pending_delivery_survives_restart_and_expired_lease(kanban_home):
 
     assert {item.id for item in replayed} == {item.id for item in first_claim}
     assert replayed[0].lease_token != first_claim[0].lease_token
+    assert {item.idempotency_key for item in replayed} == {
+        item.idempotency_key for item in first_claim
+    }
 
 
 def test_duplicate_ticks_do_not_duplicate_due_followups(kanban_home):
@@ -96,9 +215,9 @@ def test_duplicate_ticks_do_not_duplicate_due_followups(kanban_home):
         first = followup.evaluate_tick(conn, now=7_000)
         second = followup.evaluate_tick(conn, now=7_000)
 
-        assert first == 2
+        assert first == 4
         assert second == 0
-        assert len(_outbox_rows(conn)) == 2
+        assert len(_outbox_rows(conn)) == 4
 
 
 def test_dead_runner_emits_blocker_without_relying_on_heartbeat(kanban_home, monkeypatch):
@@ -118,9 +237,12 @@ def test_dead_runner_emits_blocker_without_relying_on_heartbeat(kanban_home, mon
         monkeypatch.setattr(os, "kill", missing_pid)
         followup.evaluate_tick(conn, now=1_001)
         rows = _outbox_rows(conn)
+        recovered = kb.get_task(conn, task_id)
 
     assert [row["milestone"] for row in rows] == ["blocker"]
     assert followup._json_payload(rows[0]["payload"])["snapshot"]["owner_issue"] == "dead_owner"
+    assert recovered.status == "ready"
+    assert recovered.current_run_id is None
 
 
 def test_mismatched_run_owner_is_fenced_before_pid_probe(kanban_home, monkeypatch):
@@ -142,6 +264,41 @@ def test_mismatched_run_owner_is_fenced_before_pid_probe(kanban_home, monkeypatc
 
     assert payload["snapshot"]["owner_issue"] == "mismatched_owner"
     assert probes == []
+
+
+def test_reused_owner_pid_alerts_without_takeover(kanban_home, monkeypatch):
+    import psutil
+
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        kb.claim_task(conn, task_id, claimer="legacy-local-owner")
+        task = kb.get_task(conn, task_id)
+        conn.execute("UPDATE tasks SET worker_pid=2468 WHERE id=?", (task_id,))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=2468 WHERE id=?",
+            (task.current_run_id,),
+        )
+        run_started = conn.execute(
+            "SELECT started_at FROM task_runs WHERE id=?", (task.current_run_id,)
+        ).fetchone()["started_at"]
+        conn.commit()
+        monkeypatch.setattr(os, "kill", lambda *_: None)
+
+        class ReusedProcess:
+            def __init__(self, pid):
+                assert pid == 2468
+
+            def create_time(self):
+                return run_started + 30
+
+        monkeypatch.setattr(psutil, "Process", ReusedProcess)
+        followup.evaluate_tick(conn, now=1_001)
+        payload = followup._json_payload(_outbox_rows(conn)[0]["payload"])
+        task_after = kb.get_task(conn, task_id)
+
+    assert payload["snapshot"]["owner_issue"] == "reused_owner_pid"
+    assert task_after.status == "running"
+    assert task_after.current_run_id == task.current_run_id
 
 
 @pytest.mark.parametrize("pid_error", [None, PermissionError(), OSError("opaque")])
@@ -227,7 +384,7 @@ def test_status_and_boss_routes_dedupe_independently(kanban_home):
 
 @pytest.mark.parametrize(
     ("state", "expected_outcome"),
-    [("done", "DONE"), ("blocked", "NOT DONE")],
+    [("done", "DONE"), ("archived", "DONE")],
 )
 def test_terminal_outcome_is_unique_per_route(kanban_home, state, expected_outcome):
     with kb.connect() as conn:
@@ -244,7 +401,7 @@ def test_terminal_outcome_is_unique_per_route(kanban_home, state, expected_outco
     assert [row["milestone"] for row in rows] == ["terminal"]
 
 
-def test_terminal_dedupe_ignores_later_artifact_enrichment(kanban_home):
+def test_terminal_new_head_creates_new_exact_fingerprint(kanban_home):
     with kb.connect() as conn:
         task_id = _linked_task(conn, boss=False)
         kb.complete_task(conn, task_id, result="done")
@@ -255,7 +412,84 @@ def test_terminal_dedupe_ignores_later_artifact_enrichment(kanban_home):
             "SELECT COUNT(*) FROM kanban_followup_outbox WHERE milestone='terminal'"
         ).fetchone()[0]
 
-    assert terminal_count == 1
+    assert terminal_count == 2
+
+
+def test_blocked_then_done_has_one_terminal_delivery(kanban_home):
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        kb.block_task(conn, task_id, reason="needs credential")
+        followup.evaluate_tick(conn, now=1_001)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_followup_outbox WHERE milestone='terminal'"
+        ).fetchone()[0] == 0
+        assert kb.unblock_task(conn, task_id)
+        assert kb.complete_task(conn, task_id, result="fixed")
+        followup.evaluate_tick(conn, now=1_002)
+        rows = conn.execute(
+            "SELECT * FROM kanban_followup_outbox WHERE milestone='terminal'"
+        ).fetchall()
+
+    assert len(rows) == 1
+
+
+def test_stale_head_reaches_90m_stall_and_rearms_on_new_head(kanban_home):
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        followup.record_artifact(conn, task_id, {"head": "abc"}, created_at=1_100)
+        followup.evaluate_tick(conn, now=1_100)
+        assert followup.evaluate_tick(conn, now=6_501) == 2
+        assert followup.evaluate_tick(conn, now=6_502) == 0
+        followup.record_artifact(conn, task_id, {"head": "def"}, created_at=6_503)
+        followup.evaluate_tick(conn, now=6_503)
+        assert followup.evaluate_tick(conn, now=11_904) == 1
+        stalls = conn.execute(
+            "SELECT * FROM kanban_followup_outbox WHERE milestone='90m'"
+        ).fetchall()
+
+    assert len(stalls) == 2
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        {"evidence_path": "/tmp/report.json"},
+        {"evidence_url": "https://example.invalid/evidence"},
+        {"canary": "passed"},
+        {"deployment": "deploy-1"},
+        {"verdict": "FAIL"},
+    ],
+)
+def test_any_durable_artifact_satisfies_30m_sla(kanban_home, artifact):
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        followup.record_artifact(conn, task_id, artifact, created_at=1_100)
+        followup.evaluate_tick(conn, now=2_801)
+        breaches = conn.execute(
+            "SELECT * FROM kanban_followup_outbox WHERE milestone='30m'"
+        ).fetchall()
+
+    assert breaches == []
+
+
+def test_completion_metadata_feeds_exact_head_verdict_artifact(kanban_home):
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        assert kb.complete_task(
+            conn, task_id, result="ready", metadata={
+                "head_sha": "abc123", "verdict": "PASS",
+                "evidence_path": "/tmp/review.txt",
+            },
+        )
+        followup.evaluate_tick(conn, now=1_001)
+        terminal = conn.execute(
+            "SELECT payload FROM kanban_followup_outbox WHERE milestone='terminal'"
+        ).fetchone()
+        snapshot = followup._json_payload(terminal["payload"])["snapshot"]
+
+    assert snapshot["artifacts"]["head_sha"] == "abc123"
+    assert snapshot["verdict"] == "PASS"
+    assert snapshot["artifacts"]["evidence_path"] == "/tmp/review.txt"
 
 
 def test_isolated_dry_run_canary_requires_positive_message_id_evidence(kanban_home):

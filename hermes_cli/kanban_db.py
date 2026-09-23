@@ -1554,6 +1554,57 @@ def create_task(
             )
         skills_list = cleaned
 
+    # A control-plane intake ID is itself an idempotency key. Retrying the
+    # supported intake must resolve to the same native executor, never create
+    # a second writer or silently move the control handle to another task.
+    if followup_control_id:
+        linked = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id=?",
+            (str(followup_control_id),),
+        ).fetchone()
+        if linked is not None and linked["native_task_id"]:
+            existing_task = conn.execute(
+                "SELECT id FROM tasks WHERE id=?", (linked["native_task_id"],)
+            ).fetchone()
+            if existing_task is None:
+                raise ValueError(
+                    f"control id {followup_control_id!r} references missing native task "
+                    f"{linked['native_task_id']!r}; repair the stale link before retrying"
+                )
+            requested_route = (
+                followup_origin_platform,
+                followup_origin_chat_id,
+                followup_origin_thread_id or "",
+            )
+            stored_route = (
+                linked["origin_platform"], linked["origin_chat_id"],
+                linked["origin_thread_id"] or "",
+            )
+            for label, stored, requested in zip(
+                ("platform", "chat", "thread"), stored_route, requested_route
+            ):
+                if stored not in (None, "") and requested not in (None, "", stored):
+                    raise ValueError(
+                        f"control id {followup_control_id!r} already has a different "
+                        f"Boss {label}; route changes require an explicit operator repair"
+                    )
+            now_existing = int(time.time())
+            with write_txn(conn):
+                conn.execute(
+                    """UPDATE kanban_followup_links SET
+                         origin_platform=COALESCE(origin_platform, ?),
+                         origin_chat_id=COALESCE(origin_chat_id, ?),
+                         origin_thread_id=CASE
+                           WHEN origin_thread_id = '' THEN ? ELSE origin_thread_id END,
+                         updated_at=? WHERE control_id=?""",
+                    (
+                        followup_origin_platform, followup_origin_chat_id,
+                        followup_origin_thread_id or "", now_existing,
+                        str(followup_control_id),
+                    ),
+                )
+            return str(linked["native_task_id"])
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -1567,7 +1618,30 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
-            if followup_control_id:
+            effective_control_id = (
+                followup_control_id
+                or (f"native:{row['id']}" if workspace_kind == "worktree" else None)
+            )
+            if effective_control_id:
+                existing_link = conn.execute(
+                    "SELECT * FROM kanban_followup_links WHERE control_id=?",
+                    (str(effective_control_id),),
+                ).fetchone()
+                if existing_link is not None:
+                    for label, stored, requested in (
+                        ("platform", existing_link["origin_platform"], followup_origin_platform),
+                        ("chat", existing_link["origin_chat_id"], followup_origin_chat_id),
+                        (
+                            "thread", existing_link["origin_thread_id"] or "",
+                            followup_origin_thread_id or "",
+                        ),
+                    ):
+                        if stored not in (None, "") and requested not in (None, "", stored):
+                            raise ValueError(
+                                f"control id {effective_control_id!r} already has a "
+                                f"different Boss {label}; route changes require an "
+                                "explicit operator repair"
+                            )
                 now_existing = int(time.time())
                 with write_txn(conn):
                     conn.execute(
@@ -1576,13 +1650,16 @@ def create_task(
                             origin_thread_id, created_at, updated_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(control_id) DO UPDATE SET
-                             native_task_id=excluded.native_task_id,
-                             origin_platform=COALESCE(excluded.origin_platform, origin_platform),
-                             origin_chat_id=COALESCE(excluded.origin_chat_id, origin_chat_id),
-                             origin_thread_id=excluded.origin_thread_id,
+                             native_task_id=COALESCE(native_task_id, excluded.native_task_id),
+                             origin_platform=COALESCE(origin_platform, excluded.origin_platform),
+                             origin_chat_id=COALESCE(origin_chat_id, excluded.origin_chat_id),
+                             origin_thread_id=CASE
+                               WHEN origin_thread_id = '' THEN excluded.origin_thread_id
+                               ELSE origin_thread_id
+                             END,
                              updated_at=excluded.updated_at""",
                         (
-                            str(followup_control_id), row["id"], followup_origin_platform,
+                            str(effective_control_id), row["id"], followup_origin_platform,
                             followup_origin_chat_id, followup_origin_thread_id or "",
                             now_existing, now_existing,
                         ),
@@ -1603,8 +1680,23 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        effective_control_id = (
+            followup_control_id
+            or (f"native:{task_id}" if workspace_kind == "worktree" else None)
+        )
         try:
             with write_txn(conn):
+                if effective_control_id:
+                    raced_link = conn.execute(
+                        "SELECT native_task_id FROM kanban_followup_links "
+                        "WHERE control_id=?",
+                        (str(effective_control_id),),
+                    ).fetchone()
+                    if raced_link is not None and raced_link["native_task_id"]:
+                        raise ValueError(
+                            f"control id {effective_control_id!r} was concurrently linked to "
+                            f"{raced_link['native_task_id']!r}; retry intake to reuse it"
+                        )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -1684,7 +1776,7 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
-                if followup_control_id:
+                if effective_control_id:
                     conn.execute(
                         """
                         INSERT INTO kanban_followup_links (
@@ -1692,14 +1784,17 @@ def create_task(
                             origin_chat_id, origin_thread_id, created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(control_id) DO UPDATE SET
-                            native_task_id=excluded.native_task_id,
-                            origin_platform=COALESCE(excluded.origin_platform, origin_platform),
-                            origin_chat_id=COALESCE(excluded.origin_chat_id, origin_chat_id),
-                            origin_thread_id=excluded.origin_thread_id,
+                            native_task_id=COALESCE(native_task_id, excluded.native_task_id),
+                            origin_platform=COALESCE(origin_platform, excluded.origin_platform),
+                            origin_chat_id=COALESCE(origin_chat_id, excluded.origin_chat_id),
+                            origin_thread_id=CASE
+                                WHEN origin_thread_id = '' THEN excluded.origin_thread_id
+                                ELSE origin_thread_id
+                            END,
                             updated_at=excluded.updated_at
                         """,
                         (
-                            str(followup_control_id), task_id,
+                            str(effective_control_id), task_id,
                             followup_origin_platform, followup_origin_chat_id,
                             followup_origin_thread_id or "", now, now,
                         ),
@@ -2956,6 +3051,16 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+            # Follow-up consumes this allowlisted machine-readable evidence
+            # directly from the durable completion event. Free-form metadata
+            # and private task payloads never enter notification snapshots.
+            for evidence_key in (
+                "head", "head_sha", "commit_sha", "pr_url", "artifact",
+                "verdict", "canary", "deployment", "evidence_url", "evidence_path",
+            ):
+                evidence_value = metadata.get(evidence_key)
+                if evidence_value not in (None, "", []):
+                    completed_payload[evidence_key] = evidence_value
         _append_event(
             conn, task_id, "completed",
             completed_payload,

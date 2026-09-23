@@ -712,10 +712,17 @@ def _handle_create(args: dict, **kw) -> str:
                 followup_origin_thread_id=args.get("followup_origin_thread_id"),
             )
             new_task = kb.get_task(conn, new_tid)
+            followup_link = conn.execute(
+                "SELECT control_id FROM kanban_followup_links WHERE native_task_id=? "
+                "ORDER BY created_at LIMIT 1",
+                (new_tid,),
+            ).fetchone()
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
-                followup_control_id=followup_control_id,
+                followup_control_id=(
+                    followup_link["control_id"] if followup_link is not None else None
+                ),
             )
         finally:
             conn.close()

@@ -68,6 +68,13 @@ the durable executor. A delegated child is synchronous and is cancelled when
 its parent turn is interrupted. Cron may schedule intake, but the native task,
 its run rows, and its artifacts are the delivery record.
 
+`kanban_create` atomically stores an explicitly supplied
+`followup_control_id` with the native task. A worktree task without an external
+control ID receives `native:<task-id>` automatically, so software-delivery
+intake cannot exist without a native follow-up identity. Retrying the same
+control ID returns the already-linked native task and preserves its Boss route;
+it never creates or redirects a second writer.
+
 ### Progress and delivery routes
 
 Report progress only when there is a durable artifact or a grounded failure:
@@ -96,11 +103,17 @@ Measure these deadlines from supported intake acceptance:
 | 15 minutes | The control intake is linked to a native Kanban task ID. |
 | 30 minutes | A material diff or another durable artifact exists, or a grounded failure is reported. |
 | 60 minutes | A verified commit exists, or the reported failure has been reduced to a specific reproducible cause. |
-| 90 minutes | If neither completion nor the preceding evidence exists, report the task as stalled and escalate it to the Boss origin. |
+| 90 minutes | If no new durable artifact or native state appears for 90 minutes, report the task as stalled and escalate it to the Boss origin. |
 
 An SLA update does not replace the task history. Put the artifact path, commit
 ID, verification command/result, or failure evidence on the task so recovery
 does not depend on chat history.
+
+For the terminal handoff, put machine-readable evidence in
+`kanban_complete.metadata`. The allowlisted follow-up keys are `head`,
+`head_sha`, `commit_sha`, `pr_url`, `artifact`, `artifacts`, `verdict`,
+`canary`, `deployment`, `evidence_url`, and `evidence_path`. Free-form metadata
+and task bodies are not copied into follow-up notifications.
 
 ### Durable state and single-writer fencing
 
@@ -117,6 +130,12 @@ reclaim command: it terminates that worker, closes its run as reclaimed, and
 returns the task to `ready`. Wait for that fence to complete before allowing a
 replacement worker to claim the task. Run only one gateway dispatcher for a
 board; do not run the deprecated standalone daemon beside it.
+
+The follow-up evaluator automatically invokes that same fenced reclaim path
+only when a local run and task agree on their generation/claim and the worker
+PID is provably absent. A mismatched generation, reused PID, remote owner, or
+ambiguous owner is never taken over automatically; it produces one blocker
+milestone with the task/run identity for operator inspection.
 
 ```bash
 # Inspect the source of truth.
