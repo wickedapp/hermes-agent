@@ -815,6 +815,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Canonical product-state clock. Maintained by a database trigger so
     -- every status writer, including dashboard/direct SQL paths, participates.
     status_changed_at    INTEGER,
+    -- Monotonic observation identity for status transitions. Unlike the
+    -- seconds-resolution clock, this distinguishes rapid A -> B -> A cycles.
+    status_generation    INTEGER NOT NULL DEFAULT 0,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
@@ -1172,6 +1175,31 @@ def _add_column_if_missing(
         raise
 
 
+def _install_status_transition_trigger(conn: sqlite3.Connection) -> None:
+    """Atomically upgrade the canonical status clock/generation trigger."""
+    conn.execute("SAVEPOINT install_status_transition_trigger")
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS trg_tasks_status_changed_at")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_tasks_status_changed_at
+            AFTER UPDATE OF status ON tasks
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE tasks
+                   SET status_changed_at = CAST(strftime('%s', 'now') AS INTEGER),
+                       status_generation = OLD.status_generation + 1
+                 WHERE id = NEW.id;
+            END
+            """
+        )
+        conn.execute("RELEASE SAVEPOINT install_status_transition_trigger")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT install_status_transition_trigger")
+        conn.execute("RELEASE SAVEPOINT install_status_transition_trigger")
+        raise
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -1287,6 +1315,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "status_changed_at", "status_changed_at INTEGER"
         )
+    if "status_generation" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "status_generation",
+            "status_generation INTEGER NOT NULL DEFAULT 0",
+        )
     # Backfill legacy rows without pretending that an upgrade itself was
     # product progress. Future transitions are timestamped by the trigger
     # below, regardless of which supported writer performs the UPDATE.
@@ -1308,18 +1341,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             END
             """
         )
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_tasks_status_changed_at
-            AFTER UPDATE OF status ON tasks
-            WHEN OLD.status IS NOT NEW.status
-            BEGIN
-                UPDATE tasks
-                   SET status_changed_at = CAST(strftime('%s', 'now') AS INTEGER)
-                 WHERE id = NEW.id;
-            END
-            """
-        )
+        # Recreate this trigger on every open so installations carrying the
+        # older timestamp-only definition gain the durable generation too. A
+        # savepoint keeps DROP+CREATE under one SQLite write lock, preventing
+        # concurrent gateway processes from interleaving the replacement.
+        _install_status_transition_trigger(conn)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite

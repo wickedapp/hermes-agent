@@ -156,7 +156,7 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
     task = conn.execute(
         "SELECT id, status, consecutive_failures, current_run_id, claim_lock, "
         "worker_pid, worker_process_started_at, started_at, last_heartbeat_at, "
-        "created_at, status_changed_at, last_failure_error, "
+        "created_at, status_changed_at, status_generation, last_failure_error, "
         "claim_expires "
         "FROM tasks WHERE id = ?",
         (native_task_id,),
@@ -200,6 +200,7 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         "verdict": verdict,
         "owner_issue": owner_issue,
         "changed_at": changed_at,
+        "state_generation": int(task["status_generation"] or 0),
         "transition_generation": transition_generation,
     }
 
@@ -270,6 +271,7 @@ def artifact_fingerprint(snapshot: dict[str, Any]) -> str:
         "verdict": snapshot.get("verdict"),
         "state": snapshot.get("state"),
         "failure_count": int(snapshot.get("failure_count") or 0),
+        "state_generation": int(snapshot.get("state_generation") or 0),
         "transition_generation": snapshot.get("transition_generation"),
     }
     raw = json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)

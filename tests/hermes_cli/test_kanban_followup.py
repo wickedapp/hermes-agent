@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -704,6 +705,107 @@ def test_old_queued_task_claim_resets_stall_clock(kanban_home):
         ).fetchone()[0]
 
     assert stalls == 0
+
+
+@pytest.mark.parametrize(
+    ("states", "repeated_state", "milestone"),
+    [
+        (("blocked", "ready", "blocked"), "blocked", "blocker"),
+        (("running", "review", "running"), "running", "30m"),
+    ],
+)
+def test_repeated_state_has_new_restart_persistent_generation(
+    kanban_home, states, repeated_state, milestone,
+):
+    """A -> B -> A is a new observation even without a new code artifact."""
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, created_at=1_000, boss=False)
+        generations = []
+        for state in states:
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (state, task_id))
+            conn.commit()
+            generations.append(
+                followup._snapshot(conn, task_id)["state_generation"]
+            )
+            followup.evaluate_tick(conn, now=3_000)
+
+    # Reopen the board to prove that the observation generation is durable,
+    # rather than process-local scheduler state.
+    with kb.connect() as conn:
+        snapshot = followup._snapshot(conn, task_id)
+        rows = conn.execute(
+            "SELECT artifact_fingerprint FROM kanban_followup_outbox "
+            "WHERE milestone=? AND json_extract(payload, '$.snapshot.state')=?",
+            (milestone, repeated_state),
+        ).fetchall()
+
+    assert generations[0] < generations[1] < generations[2]
+    assert snapshot["state_generation"] == generations[-1]
+    assert len(rows) == 2
+    assert len({row["artifact_fingerprint"] for row in rows}) == 2
+
+
+def test_existing_timestamp_only_trigger_is_upgraded(kanban_home):
+    """Opening an upgraded board must replace the pre-generation trigger."""
+    with kb.connect() as conn:
+        conn.execute("DROP TRIGGER trg_tasks_status_changed_at")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_tasks_status_changed_at
+            AFTER UPDATE OF status ON tasks
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE tasks
+                   SET status_changed_at = CAST(strftime('%s', 'now') AS INTEGER)
+                 WHERE id = NEW.id;
+            END
+            """
+        )
+        conn.commit()
+
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="upgraded board")
+        before = conn.execute(
+            "SELECT status_generation FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0]
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+        after = conn.execute(
+            "SELECT status_generation FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0]
+
+    assert after == before + 1
+
+
+def test_status_trigger_upgrade_is_safe_across_concurrent_connections(kanban_home):
+    db_path = kb.kanban_db_path()
+    barrier = threading.Barrier(2)
+
+    def install():
+        conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=10)
+        try:
+            barrier.wait()
+            kb._install_status_transition_trigger(conn)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: install(), range(2)))
+
+    with kb.connect() as conn:
+        triggers = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='trigger' AND name='trg_tasks_status_changed_at'"
+        ).fetchone()[0]
+        task_id = kb.create_task(conn, title="concurrent migration")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        generation = conn.execute(
+            "SELECT status_generation FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0]
+
+    assert triggers == 1
+    assert generation == 1
 
 
 @pytest.mark.parametrize(
