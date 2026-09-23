@@ -30,7 +30,9 @@ _NOISY_EVENT_KINDS = {"heartbeat", "log", "comment", "claimed", "spawned"}
 _TERMINAL_STATES = {"done", "archived"}
 _STATE_EVENT_KINDS = {
     "created", "completed", "blocked", "unblocked", "archived", "restored",
+    "crashed", "timed_out", "gave_up", "reclaimed", "stale",
 }
+_RECOVERY_EVENT_KINDS = {"crashed", "timed_out", "gave_up", "reclaimed", "stale"}
 
 
 @dataclass(frozen=True)
@@ -154,7 +156,8 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         return {"native_task_id": None, "state": "unlinked", "failure_count": 0}
     task = conn.execute(
         "SELECT id, status, consecutive_failures, current_run_id, claim_lock, "
-        "worker_pid, started_at, last_heartbeat_at, created_at, last_failure_error, "
+        "worker_pid, worker_process_started_at, started_at, last_heartbeat_at, "
+        "created_at, last_failure_error, "
         "claim_expires "
         "FROM tasks WHERE id = ?",
         (native_task_id,),
@@ -164,9 +167,10 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
 
     artifacts: dict[str, Any] = {}
     verdict = None
+    transition_generation = None
     changed_at = int(task["created_at"] or 0)
     events = conn.execute(
-        "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC",
+        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC",
         (native_task_id,),
     ).fetchall()
     for event in events:
@@ -175,6 +179,8 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         payload = _json_payload(event["payload"])
         if event["kind"] == "followup_artifact" or event["kind"] in _STATE_EVENT_KINDS:
             changed_at = max(changed_at, int(event["created_at"] or 0))
+        if event["kind"] in _RECOVERY_EVENT_KINDS:
+            transition_generation = int(event["id"])
         for key in _ARTIFACT_KEYS:
             if key in payload and payload[key] not in (None, "", []):
                 artifacts[key] = payload[key]
@@ -191,6 +197,7 @@ def _snapshot(conn: sqlite3.Connection, native_task_id: Optional[str]) -> dict[s
         "verdict": verdict,
         "owner_issue": owner_issue,
         "changed_at": changed_at,
+        "transition_generation": transition_generation,
     }
 
 
@@ -201,7 +208,8 @@ def _owner_issue(conn: sqlite3.Connection, task: sqlite3.Row) -> Optional[str]:
     if run_id is None:
         return "missing_generation"
     run = conn.execute(
-        "SELECT id, status, claim_lock, worker_pid, started_at FROM task_runs "
+        "SELECT id, status, claim_lock, worker_pid, worker_process_started_at, "
+        "started_at FROM task_runs "
         "WHERE id = ? AND task_id = ?",
         (run_id, task["id"]),
     ).fetchone()
@@ -209,7 +217,11 @@ def _owner_issue(conn: sqlite3.Connection, task: sqlite3.Row) -> Optional[str]:
         return "missing_generation"
     if run["status"] != "running":
         return "stale_generation"
-    if run["claim_lock"] != task["claim_lock"] or run["worker_pid"] != task["worker_pid"]:
+    if (
+        run["claim_lock"] != task["claim_lock"]
+        or run["worker_pid"] != task["worker_pid"]
+        or run["worker_process_started_at"] != task["worker_process_started_at"]
+    ):
         return "mismatched_owner"
     lock = str(task["claim_lock"] or "")
     local_prefix = f"{socket.gethostname()}:"
@@ -225,23 +237,22 @@ def _owner_issue(conn: sqlite3.Connection, task: sqlite3.Row) -> Optional[str]:
         if int(time.time()) - int(run["started_at"] or 0) < 60:
             return None
         return "missing_owner"
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return "dead_owner"
-    except (PermissionError, OSError):
-        pass
+    recorded_process_start = run["worker_process_started_at"]
+    if recorded_process_start is None:
+        return "unverified_owner"
     try:
         import psutil  # type: ignore
-        # A live numeric PID is not proof that it is still our worker. If the
-        # OS reused it after the recorded run began, recovery must stop rather
-        # than signal an unrelated process.
-        if psutil.Process(int(pid)).create_time() > float(run["started_at"] or 0) + 2:
+        process = psutil.Process(int(pid))
+        if process.create_time() != float(recorded_process_start):
             return "reused_owner_pid"
+        if not process.is_running():
+            return "dead_owner"
     except ImportError:
-        pass
-    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
-        pass
+        return "unverified_owner"
+    except psutil.NoSuchProcess:
+        return "dead_owner"
+    except (psutil.AccessDenied, ValueError, OSError):
+        return "unverified_owner"
     return None
 
 
@@ -256,6 +267,7 @@ def artifact_fingerprint(snapshot: dict[str, Any]) -> str:
         "verdict": snapshot.get("verdict"),
         "state": snapshot.get("state"),
         "failure_count": int(snapshot.get("failure_count") or 0),
+        "transition_generation": snapshot.get("transition_generation"),
     }
     raw = json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -326,7 +338,7 @@ def evaluate_tick(
     timestamp = int(time.time()) if now is None else int(now)
     links = conn.execute("SELECT * FROM kanban_followup_links ORDER BY created_at").fetchall()
     inserted = 0
-    safe_recoveries: list[tuple[str, str, int, str, int, int]] = []
+    safe_recoveries: list[tuple[str, str, int, str, int, int, Optional[float]]] = []
     with write_txn(conn):
         for link in links:
             snapshot = _snapshot(conn, link["native_task_id"])
@@ -358,7 +370,8 @@ def evaluate_tick(
             unchanged_age = max(0, timestamp - int(observed["first_seen_at"]))
             if snapshot.get("owner_issue") in {"dead_owner", "missing_owner"}:
                 owner = conn.execute(
-                    "SELECT t.current_run_id, t.claim_lock, t.worker_pid, r.started_at "
+                    "SELECT t.current_run_id, t.claim_lock, t.worker_pid, "
+                    "r.started_at, r.worker_process_started_at "
                     "FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
                     "WHERE t.id=? AND t.status='running'",
                     (link["native_task_id"],),
@@ -368,6 +381,10 @@ def evaluate_tick(
                         str(link["native_task_id"]), snapshot["owner_issue"],
                         int(owner["current_run_id"]), str(owner["claim_lock"] or ""),
                         int(owner["worker_pid"] or 0), int(owner["started_at"] or 0),
+                        (
+                            float(owner["worker_process_started_at"])
+                            if owner["worker_process_started_at"] is not None else None
+                        ),
                     ))
             for milestone in _milestones(snapshot, age, unchanged_age):
                 # Link acceptance has one immutable semantic generation. All
@@ -419,13 +436,14 @@ def evaluate_tick(
         def _already_absent(_pid: int, _signal: int) -> None:
             raise ProcessLookupError
 
-        for task_id, reason, run_id, claim_lock, worker_pid, started_at in safe_recoveries:
+        for task_id, reason, run_id, claim_lock, worker_pid, started_at, process_started_at in safe_recoveries:
             _kb.reclaim_task(
                 conn, task_id, reason=f"followup fenced recovery: {reason}",
                 expected_run_id=run_id,
                 expected_claim_lock=claim_lock,
                 expected_worker_pid=worker_pid or None,
                 expected_started_at=started_at,
+                expected_process_started_at=process_started_at,
                 # Absence was established above. Do not signal the numeric PID
                 # again after the transaction boundary: the OS could reuse it
                 # for an unrelated process in that tiny interval.

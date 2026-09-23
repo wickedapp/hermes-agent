@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import os
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import psutil
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_followup as followup
@@ -62,6 +65,18 @@ def _outbox_rows(conn):
     ).fetchall()
 
 
+def _publish_test_owner(conn, task_id, run_id, pid, process_started_at):
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, worker_process_started_at=? WHERE id=?",
+        (pid, process_started_at, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=?, worker_process_started_at=? WHERE id=?",
+        (pid, process_started_at, run_id),
+    )
+    conn.commit()
+
+
 def test_native_intake_atomically_persists_control_link(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -78,8 +93,8 @@ def test_native_intake_atomically_persists_control_link(kanban_home):
             ("delegation-42",),
         ).fetchone()
 
-    assert link["native_task_id"] == task_id
-    assert link["origin_chat_id"] == "boss-chat"
+        assert link["native_task_id"] == task_id
+        assert link["origin_chat_id"] == "boss-chat"
 
     with kb.connect() as conn:
         assert followup.evaluate_tick(conn, now=int(link["created_at"])) == 2
@@ -87,6 +102,56 @@ def test_native_intake_atomically_persists_control_link(kanban_home):
             "SELECT route_kind FROM kanban_followup_outbox WHERE milestone='linked'"
         ).fetchall()
         assert {row["route_kind"] for row in routes} == {"status", "boss"}
+
+
+def test_concurrent_control_intake_returns_winning_link(kanban_home):
+    barrier = threading.Barrier(2)
+
+    def create():
+        with kb.connect() as conn:
+            barrier.wait()
+            return kb.create_task(
+                conn,
+                title="same delivery",
+                workspace_kind="worktree",
+                workspace_path="/tmp/repo",
+                followup_control_id="concurrent-control",
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        task_ids = list(pool.map(lambda _: create(), range(2)))
+
+    assert task_ids[0] == task_ids[1]
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id=?", (task_ids[0],)
+        ).fetchone()[0] == 1
+
+
+def test_concurrent_control_intake_rejects_conflicting_boss_route(kanban_home):
+    barrier = threading.Barrier(2)
+
+    def create(chat_id):
+        with kb.connect() as conn:
+            barrier.wait()
+            return kb.create_task(
+                conn, title="same delivery", workspace_kind="worktree",
+                workspace_path="/tmp/repo", followup_control_id="route-race",
+                followup_origin_platform="telegram",
+                followup_origin_chat_id=chat_id,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(create, chat) for chat in ("boss-a", "boss-b")]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except ValueError as exc:
+                outcomes.append(str(exc))
+
+    assert sum(isinstance(value, str) and value.startswith("t_") for value in outcomes) == 1
+    assert sum("different Boss chat" in value for value in outcomes) == 1
 
 
 def test_model_callable_route_arguments_cannot_redirect_boss(kanban_home, monkeypatch):
@@ -297,15 +362,12 @@ def test_dead_runner_emits_blocker_without_relying_on_heartbeat(kanban_home, mon
         claimed = kb.claim_task(conn, task_id, claimer="worker-generation")
         assert claimed is not None
         run_id = kb.get_task(conn, task_id).current_run_id
-        conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
-        conn.execute("UPDATE task_runs SET worker_pid=424242 WHERE id=?", (run_id,))
-        conn.commit()
+        _publish_test_owner(conn, task_id, run_id, 424242, 100.0)
 
-        def missing_pid(pid, signal):
-            assert (pid, signal) == (424242, 0)
-            raise ProcessLookupError
-
-        monkeypatch.setattr(os, "kill", missing_pid)
+        monkeypatch.setattr(
+            psutil, "Process",
+            lambda _pid: (_ for _ in ()).throw(psutil.NoSuchProcess(424242)),
+        )
         followup.evaluate_tick(conn, now=1_001)
         rows = _outbox_rows(conn)
         recovered = kb.get_task(conn, task_id)
@@ -344,23 +406,13 @@ def test_reused_owner_pid_alerts_without_takeover(kanban_home, monkeypatch):
         task_id = _linked_task(conn, boss=False)
         kb.claim_task(conn, task_id, claimer="legacy-local-owner")
         task = kb.get_task(conn, task_id)
-        conn.execute("UPDATE tasks SET worker_pid=2468 WHERE id=?", (task_id,))
-        conn.execute(
-            "UPDATE task_runs SET worker_pid=2468 WHERE id=?",
-            (task.current_run_id,),
-        )
-        run_started = conn.execute(
-            "SELECT started_at FROM task_runs WHERE id=?", (task.current_run_id,)
-        ).fetchone()["started_at"]
-        conn.commit()
-        monkeypatch.setattr(os, "kill", lambda *_: None)
-
+        _publish_test_owner(conn, task_id, task.current_run_id, 2468, 100.0)
         class ReusedProcess:
             def __init__(self, pid):
                 assert pid == 2468
 
             def create_time(self):
-                return run_started + 30
+                return 100.001
 
         monkeypatch.setattr(psutil, "Process", ReusedProcess)
         followup.evaluate_tick(conn, now=1_001)
@@ -378,13 +430,11 @@ def test_fenced_recovery_cannot_reset_replacement_owner(kanban_home, monkeypatch
         task_id = _linked_task(conn, boss=False)
         kb.claim_task(conn, task_id, claimer="old-owner")
         old = kb.get_task(conn, task_id)
-        conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
-        conn.execute(
-            "UPDATE task_runs SET worker_pid=424242 WHERE id=?",
-            (old.current_run_id,),
+        _publish_test_owner(conn, task_id, old.current_run_id, 424242, 100.0)
+        monkeypatch.setattr(
+            psutil, "Process",
+            lambda _pid: (_ for _ in ()).throw(psutil.NoSuchProcess(424242)),
         )
-        conn.commit()
-        monkeypatch.setattr(os, "kill", lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
         real_reclaim = kb.reclaim_task
 
         def race_reclaim(db, tid, **kwargs):
@@ -410,18 +460,47 @@ def test_fenced_recovery_cannot_reset_replacement_owner(kanban_home, monkeypatch
     assert after.worker_pid == 777
 
 
+def test_delayed_spawn_publish_cannot_overwrite_replacement_generation(kanban_home):
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, boss=False)
+        old = kb.claim_task(conn, task_id, claimer="old-owner")
+        assert old is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+                "ended_at=2000 WHERE id=?",
+                (old.current_run_id,),
+            )
+            replacement = conn.execute(
+                "INSERT INTO task_runs (task_id,status,claim_lock,started_at) "
+                "VALUES (?, 'running', 'replacement', 2001)",
+                (task_id,),
+            ).lastrowid
+            conn.execute(
+                "UPDATE tasks SET current_run_id=?, claim_lock='replacement', "
+                "worker_pid=NULL, worker_process_started_at=NULL WHERE id=?",
+                (replacement, task_id),
+            )
+
+        assert not kb._set_worker_pid(
+            conn, task_id, 424242,
+            expected_run_id=old.current_run_id,
+            expected_claim_lock="old-owner",
+        )
+        after = kb.get_task(conn, task_id)
+
+    assert after.current_run_id == replacement
+    assert after.claim_lock == "replacement"
+    assert after.worker_pid is None
+
+
 @pytest.mark.parametrize("pid_error", [None, PermissionError(), OSError("opaque")])
 def test_matching_live_owner_pid_probe_is_not_a_blocker(kanban_home, monkeypatch, pid_error):
     with kb.connect() as conn:
         task_id = _linked_task(conn, boss=False)
         kb.claim_task(conn, task_id, claimer="same-owner")
         task = kb.get_task(conn, task_id)
-        conn.execute("UPDATE tasks SET worker_pid=2468 WHERE id=?", (task_id,))
-        conn.execute(
-            "UPDATE task_runs SET worker_pid=2468 WHERE id=?",
-            (task.current_run_id,),
-        )
-        conn.commit()
+        _publish_test_owner(conn, task_id, task.current_run_id, 2468, 100.0)
         probes = []
 
         def probe(pid, signal):
@@ -430,9 +509,21 @@ def test_matching_live_owner_pid_probe_is_not_a_blocker(kanban_home, monkeypatch
                 raise pid_error
 
         monkeypatch.setattr(os, "kill", probe)
+
+        class MatchingProcess:
+            def __init__(self, pid):
+                assert pid == 2468
+
+            def create_time(self):
+                return 100.0
+
+            def is_running(self):
+                return True
+
+        monkeypatch.setattr(psutil, "Process", MatchingProcess)
         assert followup.evaluate_tick(conn, now=1_001) == 0
 
-    assert probes == [(2468, 0)]
+    assert probes == []
 
 
 def test_unchanged_artifact_suppresses_repeated_milestone(kanban_home):
@@ -557,6 +648,32 @@ def test_stale_head_reaches_90m_stall_and_rearms_on_new_head(kanban_home):
         ).fetchall()
 
     assert len(stalls) == 2
+
+
+@pytest.mark.parametrize(
+    "kind", ["crashed", "timed_out", "gave_up", "reclaimed", "stale"]
+)
+def test_fresh_failure_transition_resets_old_task_stall_clock(kanban_home, kind):
+    with kb.connect() as conn:
+        task_id = _linked_task(conn, created_at=1_000, boss=False)
+        followup.evaluate_tick(conn, now=6_401)
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, kind, {"evidence": "test"})
+        now = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()["created_at"]
+        followup.evaluate_tick(conn, now=now)
+        latest = followup._snapshot(conn, task_id)
+        fingerprint = followup.artifact_fingerprint(latest)
+        stalls = conn.execute(
+            "SELECT COUNT(*) FROM kanban_followup_outbox "
+            "WHERE milestone='90m' AND artifact_fingerprint=?",
+            (fingerprint,),
+        ).fetchone()[0]
+
+    assert stalls == 0
 
 
 @pytest.mark.parametrize(

@@ -391,7 +391,9 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        # Legacy PID-only rows are reclaimed fail-closed without signaling:
+        # there is no exact process-birth identity proving PID ownership.
+        assert killed == []
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
@@ -408,6 +410,7 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
+        monkeypatch.setattr(_kb, "_process_started_at", lambda _pid: 100.0)
         kb._set_worker_pid(conn, t, 12345)
 
         old_expires = int(time.time()) - 60
@@ -448,6 +451,7 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
+        monkeypatch.setattr(_kb, "_process_started_at", lambda _pid: 100.0)
         kb._set_worker_pid(conn, t, 12345)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -584,13 +588,16 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         first_run_id = kb.latest_run(conn, t).id
         old_started = int(time.time()) - 20
         conn.execute(
-            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
-            (old_started, 999999, t),
+            "UPDATE tasks SET started_at = ?, worker_pid = ?, "
+            "worker_process_started_at = ? WHERE id = ?",
+            (old_started, 999999, 100.0, t),
         )
         conn.execute(
-            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
-            (old_started, 999999, first_run_id),
+            "UPDATE task_runs SET started_at = ?, worker_pid = ?, "
+            "worker_process_started_at = ? WHERE id = ?",
+            (old_started, 999999, 100.0, first_run_id),
         )
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: 100.0)
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == [t]

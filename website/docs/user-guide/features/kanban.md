@@ -135,9 +135,13 @@ board; do not run the deprecated standalone daemon beside it.
 
 The follow-up evaluator automatically invokes that same fenced reclaim path
 only when a local run and task agree on their generation/claim and the worker
-PID is provably absent. A mismatched generation, reused PID, remote owner, or
-ambiguous owner is never taken over automatically; it produces one blocker
-milestone with the task/run identity for operator inspection.
+PID is provably absent. Worker ownership includes the OS process birth time
+captured immediately after spawn; a numeric PID alone is never sufficient.
+Recovery first wins a database compare-and-swap over the run, claim, PID, and
+birth time, then signals only that exact process identity. A mismatched
+generation, reused PID, remote owner, or ambiguous owner is never taken over
+automatically; it produces one blocker milestone with the task/run identity
+for operator inspection.
 
 Adapter dispatch is fail-closed at the crash boundary. The outbox is marked
 `ambiguous` before calling an adapter; if Hermes crashes after the platform
