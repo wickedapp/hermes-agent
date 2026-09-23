@@ -968,6 +968,8 @@ CREATE TABLE IF NOT EXISTS kanban_followup_outbox (
     next_attempt_at      INTEGER NOT NULL,
     lease_token          TEXT,
     lease_expires_at     INTEGER,
+    send_started_at      INTEGER,
+    ambiguity_replays    INTEGER NOT NULL DEFAULT 0,
     delivery_evidence    TEXT,
     last_error           TEXT,
     created_at           INTEGER NOT NULL,
@@ -1371,6 +1373,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
+
+    outbox_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='kanban_followup_outbox'"
+    ).fetchone() is not None
+    if outbox_table_exists:
+        outbox_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_followup_outbox)")
+        }
+        if "send_started_at" not in outbox_cols:
+            _add_column_if_missing(
+                conn, "kanban_followup_outbox", "send_started_at",
+                "send_started_at INTEGER",
+            )
+        if "ambiguity_replays" not in outbox_cols:
+            _add_column_if_missing(
+                conn, "kanban_followup_outbox", "ambiguity_replays",
+                "ambiguity_replays INTEGER NOT NULL DEFAULT 0",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -20,6 +21,8 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_db import write_txn
 
+
+logger = logging.getLogger(__name__)
 
 SLA_SECONDS = {"15m": 15 * 60, "30m": 30 * 60, "60m": 60 * 60, "90m": 90 * 60}
 _ARTIFACT_KEYS = {
@@ -459,10 +462,51 @@ def claim_pending(
     limit: int = 50,
     lease_seconds: int = 60,
 ) -> list[OutboxItem]:
-    """Fence and return pending deliveries; expired claims are reclaimable."""
+    """Fence deliveries and recover expired crash-boundary attempts.
+
+    A lease that expired before ``mark_dispatched`` is known not to have
+    entered the adapter and returns to pending.  An attempt that crossed the
+    send boundary is replayed once with the same stable key; a second unknown
+    outcome is retained as ``ambiguous`` for explicit reconciliation.
+    """
     timestamp = int(time.time()) if now is None else int(now)
     token = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+    reconcile_ids: list[int] = []
     with write_txn(conn):
+        reconcile_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM kanban_followup_outbox "
+                "WHERE status='sending' AND lease_expires_at <= ? "
+                "AND send_started_at IS NOT NULL AND ambiguity_replays >= 1",
+                (timestamp,),
+            ).fetchall()
+        ]
+        conn.execute(
+            "UPDATE kanban_followup_outbox SET status='pending', lease_token=NULL, "
+            "lease_expires_at=NULL WHERE status='sending' AND lease_expires_at <= ? "
+            "AND send_started_at IS NULL",
+            (timestamp,),
+        )
+        conn.execute(
+            "UPDATE kanban_followup_outbox SET status='pending', lease_token=NULL, "
+            "lease_expires_at=NULL, send_started_at=NULL, "
+            "ambiguity_replays=ambiguity_replays+1, "
+            "last_error='unknown send outcome; bounded replay with stable key' "
+            "WHERE status='sending' AND lease_expires_at <= ? "
+            "AND send_started_at IS NOT NULL AND ambiguity_replays < 1",
+            (timestamp,),
+        )
+        conn.execute(
+            "UPDATE kanban_followup_outbox SET status='ambiguous', "
+            "lease_token=NULL, lease_expires_at=NULL, "
+            "delivery_evidence='reconcile-required:' || "
+            "COALESCE(delivery_evidence, route_fingerprint), "
+            "last_error='unknown send outcome after bounded replay' "
+            "WHERE status='sending' AND lease_expires_at <= ? "
+            "AND send_started_at IS NOT NULL AND ambiguity_replays >= 1",
+            (timestamp,),
+        )
         rows = conn.execute(
             """
             SELECT id FROM kanban_followup_outbox
@@ -474,10 +518,16 @@ def claim_pending(
         ).fetchall()
         ids = [int(row["id"]) for row in rows]
         if not ids:
+            if reconcile_ids:
+                logger.error(
+                    "kanban follow-up delivery requires operator reconciliation; "
+                    "bounded stable-key replay exhausted for outbox ids=%s",
+                    reconcile_ids,
+                )
             return []
         marks = ",".join("?" for _ in ids)
         conn.execute(
-            f"UPDATE kanban_followup_outbox SET lease_token = ?, lease_expires_at = ? "
+            f"UPDATE kanban_followup_outbox SET status='sending', lease_token = ?, lease_expires_at = ? "
             f"WHERE id IN ({marks}) AND status = 'pending' "
             "AND (lease_token IS NULL OR lease_expires_at <= ?)",
             (token, timestamp + max(1, int(lease_seconds)), *ids, timestamp),
@@ -486,6 +536,12 @@ def claim_pending(
             f"SELECT * FROM kanban_followup_outbox WHERE id IN ({marks}) AND lease_token = ?",
             (*ids, token),
         ).fetchall()
+    if reconcile_ids:
+        logger.error(
+            "kanban follow-up delivery requires operator reconciliation; "
+            "bounded stable-key replay exhausted for outbox ids=%s",
+            reconcile_ids,
+        )
     return [
         OutboxItem(
             id=int(row["id"]), control_id=row["control_id"],
@@ -514,7 +570,7 @@ def mark_delivered(
         cur = conn.execute(
             "UPDATE kanban_followup_outbox SET status='delivered', delivered_at=?, "
             "delivery_evidence=?, lease_token=NULL, lease_expires_at=NULL "
-            "WHERE id=? AND status IN ('pending', 'ambiguous') AND lease_token=?",
+            "WHERE id=? AND status='sending' AND lease_token=?",
             (timestamp, str(evidence), int(outbox_id), lease_token),
         )
     return cur.rowcount == 1
@@ -526,19 +582,18 @@ def mark_dispatched(
     lease_token: str,
     evidence: str,
 ) -> bool:
-    """Persist the adapter-call crash boundary before external delivery.
+    """Persist that this leased attempt is entering ``adapter.send``.
 
-    Once this commits the row is deliberately not retryable.  A crash or
-    exception after the adapter is invoked is ambiguous and fails closed,
-    avoiding a blind duplicate on adapters without reconciliation support.
+    This is not a terminal state. If no receipt is recorded, lease recovery
+    performs one bounded replay with the same event fingerprint.
     """
     if not str(evidence or "").strip():
         raise ValueError("dispatch evidence is required")
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_followup_outbox SET status='ambiguous', "
-            "delivery_evidence=? WHERE id=? AND status='pending' AND lease_token=?",
-            (str(evidence), int(outbox_id), lease_token),
+            "UPDATE kanban_followup_outbox SET send_started_at=?, "
+            "delivery_evidence=? WHERE id=? AND status='sending' AND lease_token=?",
+            (int(time.time()), str(evidence), int(outbox_id), lease_token),
         )
     return cur.rowcount == 1
 
@@ -555,7 +610,7 @@ def mark_failed(
     timestamp = int(time.time()) if now is None else int(now)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT attempts FROM kanban_followup_outbox WHERE id=? AND status='pending' "
+            "SELECT attempts FROM kanban_followup_outbox WHERE id=? AND status='sending' "
             "AND lease_token=?",
             (int(outbox_id), lease_token),
         ).fetchone()
@@ -564,7 +619,8 @@ def mark_failed(
         attempts = int(row["attempts"] or 0) + 1
         delay = min(3600, 5 * (2 ** min(attempts - 1, 9)))
         cur = conn.execute(
-            "UPDATE kanban_followup_outbox SET attempts=?, next_attempt_at=?, last_error=?, "
+            "UPDATE kanban_followup_outbox SET status='pending', attempts=?, "
+            "next_attempt_at=?, last_error=?, send_started_at=NULL, "
             "lease_token=NULL, lease_expires_at=NULL WHERE id=? AND lease_token=?",
             (attempts, timestamp + delay, str(error)[:1000], int(outbox_id), lease_token),
         )

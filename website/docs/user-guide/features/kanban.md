@@ -143,13 +143,14 @@ generation, reused PID, remote owner, or ambiguous owner is never taken over
 automatically; it produces one blocker milestone with the task/run identity
 for operator inspection.
 
-Adapter dispatch is fail-closed at the crash boundary. The outbox is marked
-`ambiguous` before calling an adapter; if Hermes crashes after the platform
-accepts a message but before the receipt write, it does not blindly retry.
-Adapters that return `success=True` without a message ID are finalized with a
-stable local acceptance receipt. Operators may inspect ambiguous rows and
-reconcile them with platform history using the logged `delivery_key`; automatic
-replay requires an adapter-supported idempotency or reconciliation primitive.
+Adapter dispatch uses a durable `sending` lease and the stable `delivery_key`.
+A crash before the send boundary returns the row to pending. If Hermes crashes
+after platform acceptance but before its receipt write, the external outcome is
+unknowable on adapters without idempotency or lookup support; Hermes therefore
+replays once with the same key (at-least-once transport), then marks a second
+unknown outcome `ambiguous` for explicit reconciliation instead of retrying
+forever or silently losing the report. Adapters that return `success=True`
+without a message ID are finalized with a stable local acceptance receipt.
 
 ```bash
 # Inspect the source of truth.

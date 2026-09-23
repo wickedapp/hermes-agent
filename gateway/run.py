@@ -4937,20 +4937,40 @@ class GatewayRunner:
             if item.thread_id:
                 metadata["thread_id"] = item.thread_id
             try:
-                dispatched = await asyncio.to_thread(
-                    self._kanban_followup_dispatched,
-                    board_slug,
-                    item,
-                    f"adapter-call:{item.idempotency_key}",
+                async def _before_send() -> bool:
+                    return await asyncio.to_thread(
+                        self._kanban_followup_dispatched,
+                        board_slug,
+                        item,
+                        f"adapter-call:{item.idempotency_key}",
+                    )
+
+                # Adapter-owned boundary: the durable CAS is awaited at
+                # coroutine entry and gates outbound I/O.
+                dispatched, result = await adapter.send_after_durable_boundary(
+                    item.chat_id,
+                    message,
+                    metadata=metadata,
+                    before_send=_before_send,
                 )
                 if not dispatched:
                     continue
-                result = await adapter.send(item.chat_id, message, metadata=metadata)
                 message_id = getattr(result, "message_id", None) if result is not None else None
                 success = bool(result is not None and getattr(result, "success", False))
                 if not success:
                     error = getattr(result, "error", None) if result is not None else None
-                    raise RuntimeError(error or "send was not accepted")
+                    # Once adapter.send has been entered, a failure result is
+                    # not proof that the platform rejected the request. Some
+                    # adapters return failures for response timeouts after the
+                    # remote may have accepted it. Retain the sending lease so
+                    # the bounded stable-key ambiguity replay applies.
+                    logger.warning(
+                        "kanban follow-up adapter outcome unknown after dispatch "
+                        "(key=%s): %s",
+                        item.idempotency_key,
+                        error or "send was not confirmed",
+                    )
+                    continue
                 evidence = str(message_id) if message_id else (
                     f"adapter-success:no-message-id:{item.idempotency_key}"
                 )
@@ -4961,6 +4981,9 @@ class GatewayRunner:
                     evidence,
                 )
             except Exception as exc:
+                # The adapter raised after its call began, so acceptance is
+                # unknowable. Keep the sending lease intact: expiry performs
+                # the single stable-key replay, then requires reconciliation.
                 logger.warning(
                     "kanban follow-up delivery ambiguous after adapter dispatch "
                     "(key=%s): %s", item.idempotency_key, exc,

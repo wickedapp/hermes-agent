@@ -777,20 +777,52 @@ def test_isolated_dry_run_canary_requires_positive_message_id_evidence(kanban_ho
     }
 
 
-def test_dispatched_crash_boundary_is_not_retried(kanban_home):
+def test_pre_send_crash_recovers_to_pending(kanban_home):
     with kb.connect() as conn:
         _linked_task(conn, boss=False)
         followup.evaluate_tick(conn, now=3_000)
-        item = followup.claim_pending(conn, now=3_000, limit=1)[0]
+        item = followup.claim_pending(conn, now=3_000, limit=1, lease_seconds=10)[0]
+        # Crash before mark_dispatched/adapter.send.
+    with kb.connect() as restarted:
+        replay = followup.claim_pending(restarted, now=3_011, limit=1)[0]
+        row = restarted.execute(
+            "SELECT status, ambiguity_replays FROM kanban_followup_outbox WHERE id=?",
+            (item.id,),
+        ).fetchone()
+    assert replay.id == item.id
+    assert replay.idempotency_key == item.idempotency_key
+    assert dict(row) == {"status": "sending", "ambiguity_replays": 0}
+
+
+def test_post_accept_crash_replays_once_then_requires_reconciliation(
+    kanban_home, caplog,
+):
+    with kb.connect() as conn:
+        _linked_task(conn, boss=False)
+        followup.evaluate_tick(conn, now=3_000)
+        item = followup.claim_pending(conn, now=3_000, limit=1, lease_seconds=10)[0]
         assert followup.mark_dispatched(
             conn, item.id, item.lease_token, f"adapter-call:{item.idempotency_key}"
         )
         # Simulate process death after platform acceptance and before receipt.
     with kb.connect() as restarted:
-        assert followup.claim_pending(restarted, now=99_999) == []
+        replay = followup.claim_pending(
+            restarted, now=3_011, limit=1, lease_seconds=10
+        )[0]
+        assert replay.idempotency_key == item.idempotency_key
+        assert followup.mark_dispatched(
+            restarted, replay.id, replay.lease_token,
+            f"adapter-call:{replay.idempotency_key}",
+        )
+        assert followup.claim_pending(restarted, now=3_022) == []
         row = restarted.execute(
-            "SELECT status, delivery_evidence FROM kanban_followup_outbox WHERE id=?",
+            "SELECT status, ambiguity_replays, delivery_evidence, last_error "
+            "FROM kanban_followup_outbox WHERE id=?",
             (item.id,),
         ).fetchone()
     assert row["status"] == "ambiguous"
+    assert row["ambiguity_replays"] == 1
+    assert row["delivery_evidence"].startswith("reconcile-required:")
     assert item.idempotency_key in row["delivery_evidence"]
+    assert row["last_error"] == "unknown send outcome after bounded replay"
+    assert "requires operator reconciliation" in caplog.text

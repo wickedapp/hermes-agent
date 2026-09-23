@@ -16,6 +16,13 @@ class RecordingAdapter:
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
+    async def send_after_durable_boundary(
+        self, chat_id, text, *, metadata, before_send,
+    ):
+        if not await before_send():
+            return False, None
+        return True, await self.send(chat_id, text, metadata=metadata)
+
 
 class ReceiptAdapter(RecordingAdapter):
     async def send(self, chat_id, text, metadata=None):
@@ -151,6 +158,12 @@ class SuccessWithoutMessageIdAdapter(RecordingAdapter):
         return SimpleNamespace(success=True, message_id=None)
 
 
+class UnknownOutcomeAdapter(RecordingAdapter):
+    async def send(self, chat_id, text, metadata=None):
+        await super().send(chat_id, text, metadata=metadata)
+        return SimpleNamespace(success=False, error="response timed out")
+
+
 def test_followup_success_without_message_id_is_finalized(tmp_path, monkeypatch):
     db_path = tmp_path / "followup-no-message-id.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -180,6 +193,57 @@ def test_followup_success_without_message_id_is_finalized(tmp_path, monkeypatch)
         row["delivery_evidence"].startswith("adapter-success:no-message-id:")
         for row in rows
     )
+
+
+def test_followup_boundary_cas_failure_executes_no_adapter_send(tmp_path, monkeypatch):
+    db_path = tmp_path / "followup-send-order.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="send ordering")
+        from hermes_cli import kanban_followup as followup
+        followup.register_link(
+            conn, "control", tid, origin_platform="telegram",
+            origin_chat_id="boss-chat",
+        )
+
+    adapter = ReceiptAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_followup_dispatched = lambda board, item, evidence: False
+    asyncio.run(runner._kanban_followup_tick())
+
+    assert adapter.sent == []
+
+
+def test_followup_failure_result_uses_bounded_ambiguity_replay(tmp_path, monkeypatch):
+    db_path = tmp_path / "followup-unknown-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unknown result")
+        from hermes_cli import kanban_followup as followup
+        followup.register_link(
+            conn, "control", tid, origin_platform="telegram",
+            origin_chat_id="boss-chat",
+        )
+
+    adapter = UnknownOutcomeAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(runner._kanban_followup_tick())
+
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT id, status, lease_expires_at, ambiguity_replays "
+            "FROM kanban_followup_outbox ORDER BY id LIMIT 1"
+        ).fetchone()
+        replay = followup.claim_pending(
+            conn, now=int(row["lease_expires_at"]) + 1, limit=1
+        )[0]
+
+    assert row["status"] == "sending"
+    assert row["ambiguity_replays"] == 0
+    assert replay.id == row["id"]
+    assert replay.idempotency_key == adapter.sent[0]["metadata"]["idempotency_key"]
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

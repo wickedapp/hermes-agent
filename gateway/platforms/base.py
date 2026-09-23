@@ -1596,6 +1596,25 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def send_after_durable_boundary(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]],
+        before_send: Callable[[], Awaitable[bool]],
+    ) -> tuple[bool, Optional[SendResult]]:
+        """Enter a durable caller boundary immediately before outbound I/O.
+
+        Long-task outbox delivery uses this adapter-owned invocation surface so
+        a failed boundary CAS cannot execute ``send``. There is intentionally
+        no suspension point between a successful callback and entering the
+        platform adapter's send coroutine.
+        """
+        if not await before_send():
+            return False, None
+        return True, await self.send(chat_id, content, metadata=metadata)
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close
