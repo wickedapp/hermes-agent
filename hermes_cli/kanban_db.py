@@ -812,6 +812,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     body                 TEXT,
     assignee             TEXT,
     status               TEXT NOT NULL,
+    -- Canonical product-state clock. Maintained by a database trigger so
+    -- every status writer, including dashboard/direct SQL paths, participates.
+    status_changed_at    INTEGER,
+    -- Monotonic observation identity for status transitions. Unlike the
+    -- seconds-resolution clock, this distinguishes rapid A -> B -> A cycles.
+    status_generation    INTEGER NOT NULL DEFAULT 0,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
     created_at           INTEGER NOT NULL,
@@ -831,6 +837,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    worker_process_started_at REAL,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -905,6 +912,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_process_started_at REAL,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -933,6 +941,53 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable control-plane linkage and delivery queue for long-task follow-up.
+-- ``native_task_id`` is nullable so a control item can be registered before
+-- its native worker task is known; the 15-minute SLA reports that condition.
+CREATE TABLE IF NOT EXISTS kanban_followup_links (
+    control_id       TEXT PRIMARY KEY,
+    native_task_id   TEXT,
+    origin_platform  TEXT,
+    origin_chat_id   TEXT,
+    origin_thread_id TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_followup_outbox (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    control_id           TEXT NOT NULL,
+    native_task_id       TEXT,
+    route_kind           TEXT NOT NULL,
+    route_fingerprint    TEXT NOT NULL,
+    platform             TEXT NOT NULL,
+    chat_id              TEXT NOT NULL,
+    thread_id            TEXT NOT NULL DEFAULT '',
+    milestone            TEXT NOT NULL,
+    artifact_fingerprint TEXT NOT NULL,
+    payload              TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at      INTEGER NOT NULL,
+    lease_token          TEXT,
+    lease_expires_at     INTEGER,
+    send_started_at      INTEGER,
+    ambiguity_replays    INTEGER NOT NULL DEFAULT 0,
+    delivery_evidence    TEXT,
+    last_error           TEXT,
+    created_at           INTEGER NOT NULL,
+    delivered_at         INTEGER,
+    UNIQUE(control_id, route_fingerprint, milestone, artifact_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_followup_observations (
+    control_id           TEXT NOT NULL,
+    artifact_fingerprint TEXT NOT NULL,
+    first_seen_at        INTEGER NOT NULL,
+    last_seen_at         INTEGER NOT NULL,
+    PRIMARY KEY (control_id, artifact_fingerprint)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -942,6 +997,11 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_followup_native        ON kanban_followup_links(native_task_id);
+CREATE INDEX IF NOT EXISTS idx_followup_outbox_ready  ON kanban_followup_outbox(status, next_attempt_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_followup_terminal_once_v2
+    ON kanban_followup_outbox(control_id, route_fingerprint, artifact_fingerprint)
+    WHERE milestone = 'terminal';
 """
 
 
@@ -1115,6 +1175,31 @@ def _add_column_if_missing(
         raise
 
 
+def _install_status_transition_trigger(conn: sqlite3.Connection) -> None:
+    """Atomically upgrade the canonical status clock/generation trigger."""
+    conn.execute("SAVEPOINT install_status_transition_trigger")
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS trg_tasks_status_changed_at")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_tasks_status_changed_at
+            AFTER UPDATE OF status ON tasks
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE tasks
+                   SET status_changed_at = CAST(strftime('%s', 'now') AS INTEGER),
+                       status_generation = OLD.status_generation + 1
+                 WHERE id = NEW.id;
+            END
+            """
+        )
+        conn.execute("RELEASE SAVEPOINT install_status_transition_trigger")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT install_status_transition_trigger")
+        conn.execute("RELEASE SAVEPOINT install_status_transition_trigger")
+        raise
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -1167,6 +1252,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_process_started_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_process_started_at",
+            "worker_process_started_at REAL",
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -1221,6 +1311,42 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "status_changed_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "status_changed_at", "status_changed_at INTEGER"
+        )
+    if "status_generation" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "status_generation",
+            "status_generation INTEGER NOT NULL DEFAULT 0",
+        )
+    # Backfill legacy rows without pretending that an upgrade itself was
+    # product progress. Future transitions are timestamped by the trigger
+    # below, regardless of which supported writer performs the UPDATE.
+    if "created_at" in cols:
+        conn.execute(
+            "UPDATE tasks SET status_changed_at = created_at "
+            "WHERE status_changed_at IS NULL"
+        )
+    if {"status", "created_at"}.issubset(cols):
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_status_changed_at_insert
+            AFTER INSERT ON tasks
+            WHEN NEW.status_changed_at IS NULL
+            BEGIN
+                UPDATE tasks
+                   SET status_changed_at = NEW.created_at
+                 WHERE id = NEW.id;
+            END
+            """
+        )
+        # Recreate this trigger on every open so installations carrying the
+        # older timestamp-only definition gain the durable generation too. A
+        # savepoint keeps DROP+CREATE under one SQLite write lock, preventing
+        # concurrent gateway processes from interleaving the replacement.
+        _install_status_transition_trigger(conn)
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -1250,6 +1376,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    run_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    run_cols = (
+        {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if run_table_exists else set()
+    )
+    if run_table_exists and "worker_process_started_at" not in run_cols:
+        _add_column_if_missing(
+            conn, "task_runs", "worker_process_started_at",
+            "worker_process_started_at REAL",
+        )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -1260,6 +1399,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
+
+    outbox_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='kanban_followup_outbox'"
+    ).fetchone() is not None
+    if outbox_table_exists:
+        outbox_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_followup_outbox)")
+        }
+        if "send_started_at" not in outbox_cols:
+            _add_column_if_missing(
+                conn, "kanban_followup_outbox", "send_started_at",
+                "send_started_at INTEGER",
+            )
+        if "ambiguity_replays" not in outbox_cols:
+            _add_column_if_missing(
+                conn, "kanban_followup_outbox", "ambiguity_replays",
+                "ambiguity_replays INTEGER NOT NULL DEFAULT 0",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -1411,6 +1570,10 @@ def create_task(
     max_retries: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    followup_control_id: Optional[str] = None,
+    followup_origin_platform: Optional[str] = None,
+    followup_origin_chat_id: Optional[str] = None,
+    followup_origin_thread_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -1500,6 +1663,57 @@ def create_task(
             )
         skills_list = cleaned
 
+    # A control-plane intake ID is itself an idempotency key. Retrying the
+    # supported intake must resolve to the same native executor, never create
+    # a second writer or silently move the control handle to another task.
+    if followup_control_id:
+        linked = conn.execute(
+            "SELECT * FROM kanban_followup_links WHERE control_id=?",
+            (str(followup_control_id),),
+        ).fetchone()
+        if linked is not None and linked["native_task_id"]:
+            existing_task = conn.execute(
+                "SELECT id FROM tasks WHERE id=?", (linked["native_task_id"],)
+            ).fetchone()
+            if existing_task is None:
+                raise ValueError(
+                    f"control id {followup_control_id!r} references missing native task "
+                    f"{linked['native_task_id']!r}; repair the stale link before retrying"
+                )
+            requested_route = (
+                followup_origin_platform,
+                followup_origin_chat_id,
+                followup_origin_thread_id or "",
+            )
+            stored_route = (
+                linked["origin_platform"], linked["origin_chat_id"],
+                linked["origin_thread_id"] or "",
+            )
+            for label, stored, requested in zip(
+                ("platform", "chat", "thread"), stored_route, requested_route
+            ):
+                if stored not in (None, "") and requested not in (None, "", stored):
+                    raise ValueError(
+                        f"control id {followup_control_id!r} already has a different "
+                        f"Boss {label}; route changes require an explicit operator repair"
+                    )
+            now_existing = int(time.time())
+            with write_txn(conn):
+                conn.execute(
+                    """UPDATE kanban_followup_links SET
+                         origin_platform=COALESCE(origin_platform, ?),
+                         origin_chat_id=COALESCE(origin_chat_id, ?),
+                         origin_thread_id=CASE
+                           WHEN origin_thread_id = '' THEN ? ELSE origin_thread_id END,
+                         updated_at=? WHERE control_id=?""",
+                    (
+                        followup_origin_platform, followup_origin_chat_id,
+                        followup_origin_thread_id or "", now_existing,
+                        str(followup_control_id),
+                    ),
+                )
+            return str(linked["native_task_id"])
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -1513,6 +1727,52 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            effective_control_id = (
+                followup_control_id
+                or (f"native:{row['id']}" if workspace_kind == "worktree" else None)
+            )
+            if effective_control_id:
+                existing_link = conn.execute(
+                    "SELECT * FROM kanban_followup_links WHERE control_id=?",
+                    (str(effective_control_id),),
+                ).fetchone()
+                if existing_link is not None:
+                    for label, stored, requested in (
+                        ("platform", existing_link["origin_platform"], followup_origin_platform),
+                        ("chat", existing_link["origin_chat_id"], followup_origin_chat_id),
+                        (
+                            "thread", existing_link["origin_thread_id"] or "",
+                            followup_origin_thread_id or "",
+                        ),
+                    ):
+                        if stored not in (None, "") and requested not in (None, "", stored):
+                            raise ValueError(
+                                f"control id {effective_control_id!r} already has a "
+                                f"different Boss {label}; route changes require an "
+                                "explicit operator repair"
+                            )
+                now_existing = int(time.time())
+                with write_txn(conn):
+                    conn.execute(
+                        """INSERT INTO kanban_followup_links
+                           (control_id, native_task_id, origin_platform, origin_chat_id,
+                            origin_thread_id, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(control_id) DO UPDATE SET
+                             native_task_id=COALESCE(native_task_id, excluded.native_task_id),
+                             origin_platform=COALESCE(origin_platform, excluded.origin_platform),
+                             origin_chat_id=COALESCE(origin_chat_id, excluded.origin_chat_id),
+                             origin_thread_id=CASE
+                               WHEN origin_thread_id = '' THEN excluded.origin_thread_id
+                               ELSE origin_thread_id
+                             END,
+                             updated_at=excluded.updated_at""",
+                        (
+                            str(effective_control_id), row["id"], followup_origin_platform,
+                            followup_origin_chat_id, followup_origin_thread_id or "",
+                            now_existing, now_existing,
+                        ),
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -1529,8 +1789,44 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        effective_control_id = (
+            followup_control_id
+            or (f"native:{task_id}" if workspace_kind == "worktree" else None)
+        )
         try:
             with write_txn(conn):
+                if effective_control_id:
+                    raced_link = conn.execute(
+                        "SELECT * FROM kanban_followup_links "
+                        "WHERE control_id=?",
+                        (str(effective_control_id),),
+                    ).fetchone()
+                    if raced_link is not None and raced_link["native_task_id"]:
+                        for label, stored, requested in (
+                            ("platform", raced_link["origin_platform"], followup_origin_platform),
+                            ("chat", raced_link["origin_chat_id"], followup_origin_chat_id),
+                            ("thread", raced_link["origin_thread_id"] or "", followup_origin_thread_id or ""),
+                        ):
+                            if stored not in (None, "") and requested not in (None, "", stored):
+                                raise ValueError(
+                                    f"control id {effective_control_id!r} already has a "
+                                    f"different Boss {label}; route changes require an "
+                                    "explicit operator repair"
+                                )
+                        conn.execute(
+                            """UPDATE kanban_followup_links SET
+                                 origin_platform=COALESCE(origin_platform, ?),
+                                 origin_chat_id=COALESCE(origin_chat_id, ?),
+                                 origin_thread_id=CASE
+                                   WHEN origin_thread_id = '' THEN ? ELSE origin_thread_id END,
+                                 updated_at=? WHERE control_id=?""",
+                            (
+                                followup_origin_platform, followup_origin_chat_id,
+                                followup_origin_thread_id or "", now,
+                                str(effective_control_id),
+                            ),
+                        )
+                        return str(raced_link["native_task_id"])
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -1610,6 +1906,29 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
+                if effective_control_id:
+                    conn.execute(
+                        """
+                        INSERT INTO kanban_followup_links (
+                            control_id, native_task_id, origin_platform,
+                            origin_chat_id, origin_thread_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(control_id) DO UPDATE SET
+                            native_task_id=COALESCE(native_task_id, excluded.native_task_id),
+                            origin_platform=COALESCE(origin_platform, excluded.origin_platform),
+                            origin_chat_id=COALESCE(origin_chat_id, excluded.origin_chat_id),
+                            origin_thread_id=CASE
+                                WHEN origin_thread_id = '' THEN excluded.origin_thread_id
+                                ELSE origin_thread_id
+                            END,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            str(effective_control_id), task_id,
+                            followup_origin_platform, followup_origin_chat_id,
+                            followup_origin_thread_id or "", now, now,
+                        ),
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -2220,6 +2539,8 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   worker_pid    = NULL,
+                   worker_process_started_at = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
@@ -2296,6 +2617,8 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   worker_pid    = NULL,
+                   worker_process_started_at = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'review'
@@ -2397,16 +2720,30 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "SELECT t.id, t.current_run_id, t.claim_lock, t.worker_pid, t.claim_expires, "
+        "t.last_heartbeat_at, r.worker_process_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
-        if host_local and row["worker_pid"] and _pid_alive(row["worker_pid"]):
+        identity_issue = host_local and _live_process_identity_issue(
+            row["worker_pid"], row["worker_process_started_at"]
+        )
+        if identity_issue:
+            with write_txn(conn):
+                _record_worker_identity_alert(
+                    conn, row["id"], row["current_run_id"],
+                    int(row["worker_pid"]), "release_stale_claims", identity_issue,
+                )
+            continue
+        if (
+            host_local and row["worker_pid"]
+            and _same_process(row["worker_pid"], row["worker_process_started_at"])
+        ):
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
                 cur = conn.execute(
@@ -2443,19 +2780,26 @@ def release_stale_claims(
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
-        )
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND current_run_id IS ? AND worker_pid IS ? "
+                "AND worker_process_started_at IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (
+                    row["id"], row["claim_lock"], row["current_run_id"],
+                    row["worker_pid"], row["worker_process_started_at"], now,
+                ),
             )
             if cur.rowcount != 1:
                 continue
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"],
+                process_started_at=row["worker_process_started_at"],
+                signal_fn=signal_fn,
+            )
             run_id = _end_run(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
@@ -2492,6 +2836,11 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_pid: Optional[int] = None,
+    expected_started_at: Optional[int] = None,
+    expected_process_started_at: Optional[float] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -2505,7 +2854,9 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT t.status, t.claim_lock, t.worker_pid, t.current_run_id, r.started_at, "
+        "r.worker_process_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -2513,20 +2864,46 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if expected_run_id is not None and int(row["current_run_id"] or 0) != int(expected_run_id):
+        return False
+    if expected_claim_lock is not None and str(row["claim_lock"] or "") != expected_claim_lock:
+        return False
+    if expected_worker_pid is not None and int(row["worker_pid"] or 0) != int(expected_worker_pid):
+        return False
+    if expected_started_at is not None and int(row["started_at"] or 0) != int(expected_started_at):
+        return False
+    if (
+        expected_process_started_at is not None
+        and row["worker_process_started_at"] != expected_process_started_at
+    ):
+        return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ? AND worker_pid IS ? "
+            "AND worker_process_started_at IS ? "
+            "AND (current_run_id IS NULL OR EXISTS (SELECT 1 FROM task_runs r "
+            "WHERE r.id=tasks.current_run_id AND r.started_at IS ? "
+            "AND r.worker_process_started_at IS ?))",
+            (
+                task_id, prev_lock, row["current_run_id"], row["worker_pid"],
+                row["worker_process_started_at"], row["started_at"],
+                row["worker_process_started_at"],
+            ),
         )
         if cur.rowcount != 1:
             return False
+        # Signal only after the complete owner tuple won the CAS while the
+        # write transaction excludes a replacement claim. Otherwise a new
+        # owner published between observation and reclaim could be killed.
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock,
+            process_started_at=row["worker_process_started_at"],
+            signal_fn=signal_fn,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
@@ -2862,6 +3239,16 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+            # Follow-up consumes this allowlisted machine-readable evidence
+            # directly from the durable completion event. Free-form metadata
+            # and private task payloads never enter notification snapshots.
+            for evidence_key in (
+                "head", "head_sha", "commit_sha", "pr_url", "artifact",
+                "verdict", "canary", "deployment", "evidence_url", "evidence_path",
+            ):
+                evidence_value = metadata.get(evidence_key)
+                if evidence_value not in (None, "", []):
+                    completed_payload[evidence_key] = evidence_value
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -3847,10 +4234,81 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _process_started_at(pid: Optional[int]) -> Optional[float]:
+    """Return the OS process birth time used to disambiguate PID reuse."""
+    if not pid or pid <= 0:
+        return None
+    try:
+        import psutil  # type: ignore
+        return float(psutil.Process(int(pid)).create_time())
+    except (ImportError, ValueError, OSError):
+        return None
+    except Exception as exc:
+        if exc.__class__.__module__.startswith("psutil"):
+            return None
+        raise
+
+
+def _same_process(pid: Optional[int], expected_started_at: Optional[float]) -> bool:
+    """Require an exact persisted PID + process-birth-time identity."""
+    if expected_started_at is None:
+        return False
+    if not _pid_alive(pid):
+        return False
+    actual = _process_started_at(pid)
+    return actual is not None and actual == float(expected_started_at)
+
+
+def _live_process_identity_issue(
+    pid: Optional[int], expected_started_at: Optional[float]
+) -> Optional[str]:
+    """Describe why a live PID cannot be proven to be this worker."""
+    if not pid or not _pid_alive(pid):
+        return None
+    if expected_started_at is None:
+        return "missing_recorded_birth_time"
+    actual_started_at = _process_started_at(pid)
+    if actual_started_at is None:
+        return "unreadable_process_birth_time"
+    if actual_started_at != float(expected_started_at):
+        return "process_birth_time_mismatch"
+    return None
+
+
+def _record_worker_identity_alert(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    pid: int,
+    recovery_path: str,
+    identity_issue: str,
+) -> None:
+    """Persist one operator-visible identity alert per worker generation."""
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND run_id IS ? "
+        "AND kind='worker_identity_unverifiable' LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    if existing is None:
+        _append_event(
+            conn,
+            task_id,
+            "worker_identity_unverifiable",
+            {
+                "worker_pid": int(pid),
+                "recovery_path": recovery_path,
+                "identity_issue": identity_issue,
+                "operator_action_required": True,
+            },
+            run_id=run_id,
+        )
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    process_started_at: Optional[float] = None,
     signal_fn=None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
@@ -3871,6 +4329,10 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    if not _same_process(pid, process_started_at):
+        info["identity_mismatch"] = True
+        return info
+
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
@@ -3884,12 +4346,12 @@ def _terminate_reclaimed_worker(
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not _same_process(pid, process_started_at):
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
+    if _same_process(pid, process_started_at):
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
@@ -3899,7 +4361,7 @@ def _terminate_reclaimed_worker(
         except (ProcessLookupError, OSError):
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    info["terminated"] = not _same_process(pid, process_started_at)
     return info
 
 
@@ -3977,9 +4439,9 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, r.worker_process_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -3999,41 +4461,52 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        identity_issue = _live_process_identity_issue(
+            pid, row["worker_process_started_at"]
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-
+        if identity_issue:
+            with write_txn(conn):
+                _record_worker_identity_alert(
+                    conn, tid, row["current_run_id"], pid,
+                    "enforce_max_runtime", identity_issue,
+                )
+            continue
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (tid,),
+                "WHERE id = ? AND status = 'running' AND current_run_id IS ? "
+                "AND claim_lock IS ? AND worker_pid IS ? "
+                "AND worker_process_started_at IS ?",
+                (
+                    tid, row["current_run_id"], row["claim_lock"], pid,
+                    row["worker_process_started_at"],
+                ),
             )
             if cur.rowcount == 1:
+                killed = False
+                kill = signal_fn if signal_fn is not None else (
+                    os.kill if hasattr(os, "kill") else None
+                )
+                if kill is not None and _same_process(
+                    pid, row["worker_process_started_at"]
+                ):
+                    try:
+                        kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        pass
+                    for _ in range(10):
+                        if not _same_process(pid, row["worker_process_started_at"]):
+                            break
+                        time.sleep(0.5)
+                    if _same_process(pid, row["worker_process_started_at"]):
+                        try:
+                            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                            kill(pid, _sigkill)
+                            killed = True
+                        except (ProcessLookupError, OSError):
+                            pass
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
@@ -4112,8 +4585,9 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "SELECT t.id, t.current_run_id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       r.worker_process_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -4137,21 +4611,38 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+        identity_issue = lock.startswith(host_prefix) and _live_process_identity_issue(
+            pid, row["worker_process_started_at"]
         )
+        if identity_issue:
+            with write_txn(conn):
+                _record_worker_identity_alert(
+                    conn, tid, row["current_run_id"], int(pid),
+                    "detect_stale_running", identity_issue,
+                )
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (tid,),
+                "WHERE id = ? AND status = 'running' AND current_run_id IS ? "
+                "AND claim_lock IS ? AND worker_pid IS ? "
+                "AND worker_process_started_at IS ? AND last_heartbeat_at IS ?",
+                (
+                    tid, row["current_run_id"], lock, pid,
+                    row["worker_process_started_at"], last_hb,
+                ),
             )
             if cur.rowcount != 1:
                 continue
+
+            # Signal only after this exact observed generation won the CAS.
+            termination = _terminate_reclaimed_worker(
+                pid, lock, process_started_at=row["worker_process_started_at"],
+                signal_fn=signal_fn,
+            )
 
             payload = {
                 "elapsed_seconds": int(elapsed),
@@ -4249,7 +4740,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock FROM tasks "
+            "SELECT id, current_run_id, worker_pid, worker_process_started_at, "
+            "claim_lock FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -4258,6 +4750,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
+            identity_issue = _live_process_identity_issue(
+                row["worker_pid"], row["worker_process_started_at"]
+            )
+            if identity_issue:
+                _record_worker_identity_alert(
+                    conn, row["id"], row["current_run_id"],
+                    int(row["worker_pid"]), "detect_crashed_workers",
+                    identity_issue,
+                )
+                continue
+            if not _same_process(row["worker_pid"], row["worker_process_started_at"]):
+                # A live mismatched PID belongs to another process. It is not
+                # evidence that this generation crashed, and must never be
+                # reclaimed or signaled by the dispatcher.
+                if _pid_alive(row["worker_pid"]):
+                    continue
             if _pid_alive(row["worker_pid"]):
                 continue
 
@@ -4530,25 +5038,50 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    process_started_at: Optional[float] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    if expected_run_id is None and expected_claim_lock is None:
+        owner = conn.execute(
+            "SELECT current_run_id, claim_lock FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if owner is None:
+            return False
+        expected_run_id = owner["current_run_id"]
+        expected_claim_lock = owner["claim_lock"]
+    if process_started_at is None:
+        process_started_at = _process_started_at(pid)
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_process_started_at = ? "
+            "WHERE id = ? AND status='running' AND current_run_id IS ? "
+            "AND claim_lock IS ?",
+            (int(pid), process_started_at, task_id, expected_run_id, expected_claim_lock),
         )
-        run_id = _current_run_id(conn, task_id)
+        if cur.rowcount != 1:
+            return False
+        run_id = expected_run_id
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_process_started_at = ? WHERE id = ?",
+                (int(pid), process_started_at, run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(
+            conn, task_id, "spawned",
+            {"pid": int(pid), "process_started_at": process_started_at},
+            run_id=run_id,
+        )
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -4907,7 +5440,19 @@ def dispatch_once(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                spawned_process_started_at = _process_started_at(int(pid))
+                published = _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    expected_run_id=claimed.current_run_id,
+                    expected_claim_lock=claimed.claim_lock,
+                    process_started_at=spawned_process_started_at,
+                )
+                if not published:
+                    _terminate_reclaimed_worker(
+                        int(pid), claimed.claim_lock,
+                        process_started_at=spawned_process_started_at,
+                    )
+                    continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -4988,7 +5533,19 @@ def dispatch_once(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                spawned_process_started_at = _process_started_at(int(pid))
+                published = _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    expected_run_id=claimed.current_run_id,
+                    expected_claim_lock=claimed.claim_lock,
+                    process_started_at=spawned_process_started_at,
+                )
+                if not published:
+                    _terminate_reclaimed_worker(
+                        int(pid), claimed.claim_lock,
+                        process_started_at=spawned_process_started_at,
+                    )
+                    continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:

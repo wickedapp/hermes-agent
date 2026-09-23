@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -391,7 +393,9 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        # Legacy PID-only rows are reclaimed fail-closed without signaling:
+        # there is no exact process-birth identity proving PID ownership.
+        assert killed == []
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
@@ -408,6 +412,7 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
+        monkeypatch.setattr(_kb, "_process_started_at", lambda _pid: 100.0)
         kb._set_worker_pid(conn, t, 12345)
 
         old_expires = int(time.time()) - 60
@@ -437,6 +442,126 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
+@pytest.mark.parametrize("probe_error", [psutil.AccessDenied(), OSError("opaque")])
+def test_process_birth_probe_normalizes_unreadable_errors(monkeypatch, probe_error):
+    monkeypatch.setattr(psutil, "Process", lambda _pid: (_ for _ in ()).throw(probe_error))
+    assert kb._process_started_at(12345) is None
+
+
+def test_stale_claim_preserves_live_owner_when_birth_time_unreadable(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="opaque owner", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        run = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert run is not None
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: 100.0)
+        kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=?",
+            (int(time.time()) - 1, task_id),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: None)
+        assert kb.release_stale_claims(conn) == 0
+        assert kb.release_stale_claims(conn) == 0
+        assert kb.get_task(conn, task_id).status == "running"
+        alerts = conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? "
+            "AND kind='worker_identity_unverifiable'",
+            (task_id,),
+        ).fetchall()
+        assert len(alerts) == 1
+        assert alerts[0]["run_id"] == run.current_run_id
+
+
+@pytest.mark.parametrize(
+    "recovery",
+    ["enforce_max_runtime", "detect_stale_running"],
+)
+def test_runtime_recovery_preserves_live_owner_when_birth_time_unreadable(
+    kanban_home, monkeypatch, recovery,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="opaque owner", assignee="a", max_runtime_seconds=1,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        run = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert run is not None
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: 100.0)
+        kb._set_worker_pid(conn, task_id, 12345)
+        old = int(time.time()) - 7200
+        conn.execute("UPDATE tasks SET started_at=? WHERE id=?", (old, task_id))
+        conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (old, run.current_run_id),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: None)
+
+        if recovery == "enforce_max_runtime":
+            assert kb.enforce_max_runtime(conn) == []
+        else:
+            assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == []
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == run.current_run_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='worker_identity_unverifiable'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("recorded_birth", "actual_birth", "expected_issue"),
+    [
+        (None, 100.0, "missing_recorded_birth_time"),
+        (100.0, None, "unreadable_process_birth_time"),
+        (100.0, 101.0, "process_birth_time_mismatch"),
+    ],
+)
+def test_crash_detection_alerts_without_reclaiming_ambiguous_live_owner(
+    kanban_home, monkeypatch, recorded_birth, actual_birth, expected_issue,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ambiguous live owner", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        run = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert run is not None
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: 100.0)
+        kb._set_worker_pid(conn, task_id, 12345)
+        if recorded_birth is None:
+            conn.execute(
+                "UPDATE tasks SET worker_process_started_at=NULL WHERE id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_process_started_at=NULL WHERE id=?",
+                (run.current_run_id,),
+            )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: actual_birth)
+
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.detect_crashed_workers(conn) == []
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == run.current_run_id
+        alerts = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='worker_identity_unverifiable'",
+            (task_id,),
+        ).fetchall()
+        assert len(alerts) == 1
+        assert json.loads(alerts[0]["payload"])["identity_issue"] == expected_issue
+
+
 def test_stale_claim_with_live_pid_uses_env_ttl_override(
     kanban_home, monkeypatch,
 ):
@@ -448,6 +573,7 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
+        monkeypatch.setattr(_kb, "_process_started_at", lambda _pid: 100.0)
         kb._set_worker_pid(conn, t, 12345)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -584,13 +710,16 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         first_run_id = kb.latest_run(conn, t).id
         old_started = int(time.time()) - 20
         conn.execute(
-            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
-            (old_started, 999999, t),
+            "UPDATE tasks SET started_at = ?, worker_pid = ?, "
+            "worker_process_started_at = ? WHERE id = ?",
+            (old_started, 999999, 100.0, t),
         )
         conn.execute(
-            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
-            (old_started, 999999, first_run_id),
+            "UPDATE task_runs SET started_at = ?, worker_pid = ?, "
+            "worker_process_started_at = ? WHERE id = ?",
+            (old_started, 999999, 100.0, first_run_id),
         )
+        monkeypatch.setattr(kb, "_process_started_at", lambda _pid: 100.0)
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == [t]

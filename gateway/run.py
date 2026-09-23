@@ -4552,6 +4552,11 @@ class GatewayRunner:
 
         while self._running:
             try:
+                # Long-task follow-up shares this watcher deliberately: its
+                # durable outbox needs a delivery cadence, not another
+                # unowned background loop.
+                await self._kanban_followup_tick()
+
                 def _collect():
                     deliveries: list[dict] = []
                     active_platforms = {
@@ -4829,6 +4834,192 @@ class GatewayRunner:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    async def _kanban_followup_tick(self) -> None:
+        """Evaluate durable long-task artifacts and drain their outbox."""
+        from gateway.config import Platform as _Platform
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_followup as _followup
+
+        try:
+            from hermes_cli.config import load_config as _load_config
+            _route = ((_load_config() or {}).get("kanban") or {}).get(
+                "followup_status_route"
+            ) or None
+        except Exception:
+            _route = None
+
+        def _collect_followups():
+            claimed: list[tuple[str, Any]] = []
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            seen: set[str] = set()
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    resolved = str(
+                        Path(db_path).expanduser().resolve()
+                        if db_path else _kb.kanban_db_path(slug).resolve()
+                    )
+                except Exception:
+                    resolved = f"slug:{slug}"
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    _followup.evaluate_tick(conn, status_route=_route)
+                    claimed.extend(
+                        (slug, item) for item in _followup.claim_pending(conn, limit=1)
+                    )
+                except Exception as exc:
+                    logger.debug("kanban follow-up: board %s evaluation failed: %s", slug, exc)
+                finally:
+                    if conn is not None:
+                        conn.close()
+            return claimed
+
+        deliveries = await asyncio.to_thread(_collect_followups)
+        for board_slug, item in deliveries:
+            try:
+                platform = _Platform(item.platform.lower())
+            except ValueError:
+                await asyncio.to_thread(
+                    self._kanban_followup_failed, board_slug, item,
+                    f"unknown platform: {item.platform}",
+                )
+                continue
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                await asyncio.to_thread(
+                    self._kanban_followup_failed, board_slug, item,
+                    f"adapter disconnected: {item.platform}",
+                )
+                continue
+
+            snapshot = item.payload.get("snapshot") or {}
+            state = snapshot.get("state") or "unknown"
+            if item.milestone == "terminal":
+                outcome = "DONE" if state in {"done", "archived"} else "NOT DONE"
+            elif item.milestone == "90m":
+                outcome = "STALLED"
+            elif item.milestone == "blocker":
+                outcome = "NEEDS ATTENTION"
+            else:
+                outcome = "IN PROGRESS"
+            failures = int(snapshot.get("failure_count") or 0)
+            owner_issue = snapshot.get("owner_issue")
+            evidence = snapshot.get("artifacts") or {}
+            detail = f"; owner={owner_issue}" if owner_issue else ""
+            verdict = snapshot.get("verdict") or evidence.get("verdict")
+            if item.milestone == "terminal" and not verdict:
+                verdict = "PASS" if state in {"done", "archived"} else "FAIL"
+            if verdict not in (None, ""):
+                detail += f"; verdict={verdict}"
+            if evidence:
+                detail += f"; evidence={json.dumps(evidence, sort_keys=True, default=str)[:500]}"
+            elif item.milestone == "terminal":
+                # A native task transition is itself the fallback durable
+                # artifact. This keeps terminal reports inspectable even when
+                # a non-git task has no commit or file path.
+                detail += f"; evidence=kanban-task:{item.native_task_id}"
+            message = (
+                f"Kanban follow-up [{item.milestone}] {item.control_id}"
+                f" -> {item.native_task_id or 'unlinked'}: {outcome}; "
+                f"state={state}, failures={failures}{detail}; "
+                f"delivery_key={item.idempotency_key}"
+            )
+            metadata = {"idempotency_key": item.idempotency_key}
+            if item.thread_id:
+                metadata["thread_id"] = item.thread_id
+            try:
+                async def _before_send() -> bool:
+                    return await asyncio.to_thread(
+                        self._kanban_followup_dispatched,
+                        board_slug,
+                        item,
+                        f"adapter-call:{item.idempotency_key}",
+                    )
+
+                # Adapter-owned boundary: the durable CAS is awaited at
+                # coroutine entry and gates outbound I/O.
+                dispatched, result = await adapter.send_after_durable_boundary(
+                    item.chat_id,
+                    message,
+                    metadata=metadata,
+                    before_send=_before_send,
+                )
+                if not dispatched:
+                    continue
+                message_id = getattr(result, "message_id", None) if result is not None else None
+                success = bool(result is not None and getattr(result, "success", False))
+                if not success:
+                    error = getattr(result, "error", None) if result is not None else None
+                    # Once adapter.send has been entered, a failure result is
+                    # not proof that the platform rejected the request. Some
+                    # adapters return failures for response timeouts after the
+                    # remote may have accepted it. Retain the sending lease so
+                    # the bounded stable-key ambiguity replay applies.
+                    logger.warning(
+                        "kanban follow-up adapter outcome unknown after dispatch "
+                        "(key=%s): %s",
+                        item.idempotency_key,
+                        error or "send was not confirmed",
+                    )
+                    continue
+                evidence = str(message_id) if message_id else (
+                    f"adapter-success:no-message-id:{item.idempotency_key}"
+                )
+                await asyncio.to_thread(
+                    self._kanban_followup_delivered,
+                    board_slug,
+                    item,
+                    evidence,
+                )
+            except Exception as exc:
+                # The adapter raised after its call began, so acceptance is
+                # unknowable. Keep the sending lease intact: expiry performs
+                # the single stable-key replay, then requires reconciliation.
+                logger.warning(
+                    "kanban follow-up delivery ambiguous after adapter dispatch "
+                    "(key=%s): %s", item.idempotency_key, exc,
+                )
+
+    @staticmethod
+    def _kanban_followup_dispatched(board: str, item: Any, evidence: str) -> bool:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_followup as _followup
+        conn = _kb.connect(board=board)
+        try:
+            return _followup.mark_dispatched(
+                conn, item.id, item.lease_token, evidence,
+            )
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _kanban_followup_delivered(board: str, item: Any, evidence: str) -> None:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_followup as _followup
+        conn = _kb.connect(board=board)
+        try:
+            _followup.mark_delivered(conn, item.id, item.lease_token, evidence)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _kanban_followup_failed(board: str, item: Any, error: str) -> None:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_followup as _followup
+        conn = _kb.connect(board=board)
+        try:
+            _followup.mark_failed(conn, item.id, item.lease_token, error)
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

@@ -658,6 +658,20 @@ def _handle_create(args: dict, **kw) -> str:
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    followup_control_id = args.get("followup_control_id")
+    # Notification destinations are authenticated gateway context, not model
+    # input.  Keeping them out of the tool schema prevents a prompt from
+    # redirecting milestones to an arbitrary chat.
+    try:
+        from gateway.session_context import get_authenticated_origin
+        authenticated_origin = get_authenticated_origin()
+        followup_origin_platform = authenticated_origin.get("platform") or None
+        followup_origin_chat_id = authenticated_origin.get("chat_id") or None
+        followup_origin_thread_id = authenticated_origin.get("thread_id") or None
+    except (ImportError, RuntimeError):
+        followup_origin_platform = None
+        followup_origin_chat_id = None
+        followup_origin_thread_id = None
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
@@ -705,11 +719,23 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                followup_control_id=followup_control_id,
+                followup_origin_platform=followup_origin_platform,
+                followup_origin_chat_id=followup_origin_chat_id,
+                followup_origin_thread_id=followup_origin_thread_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            followup_link = conn.execute(
+                "SELECT control_id FROM kanban_followup_links WHERE native_task_id=? "
+                "ORDER BY created_at LIMIT 1",
+                (new_tid,),
+            ).fetchone()
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                followup_control_id=(
+                    followup_link["control_id"] if followup_link is not None else None
+                ),
             )
         finally:
             conn.close()
@@ -1133,6 +1159,14 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "followup_control_id": {
+                "type": "string",
+                "description": (
+                    "Durable control-plane handle for long work. When set, "
+                    "the handle is atomically linked to the returned native task ID "
+                    "before the dispatcher can start implementation."
                 ),
             },
             "max_runtime_seconds": {

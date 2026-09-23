@@ -114,6 +114,20 @@ def set_session_vars(
     return tokens
 
 
+def get_authenticated_origin() -> dict[str, str]:
+    """Return only task-local gateway origin data, never env fallbacks."""
+    platform = _SESSION_PLATFORM.get()
+    chat_id = _SESSION_CHAT_ID.get()
+    if platform is _UNSET or chat_id is _UNSET or not platform or not chat_id:
+        return {}
+    thread_id = _SESSION_THREAD_ID.get()
+    return {
+        "platform": str(platform),
+        "chat_id": str(chat_id),
+        "thread_id": "" if thread_id is _UNSET else str(thread_id or ""),
+    }
+
+
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared.
 
