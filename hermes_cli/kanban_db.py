@@ -2704,6 +2704,16 @@ def release_stale_claims(
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
+        identity_issue = host_local and _live_process_identity_issue(
+            row["worker_pid"], row["worker_process_started_at"]
+        )
+        if identity_issue:
+            with write_txn(conn):
+                _record_worker_identity_alert(
+                    conn, row["id"], row["current_run_id"],
+                    int(row["worker_pid"]), "release_stale_claims", identity_issue,
+                )
+            continue
         if (
             host_local and row["worker_pid"]
             and _same_process(row["worker_pid"], row["worker_process_started_at"])
@@ -4223,6 +4233,51 @@ def _same_process(pid: Optional[int], expected_started_at: Optional[float]) -> b
     return actual is not None and actual == float(expected_started_at)
 
 
+def _live_process_identity_issue(
+    pid: Optional[int], expected_started_at: Optional[float]
+) -> Optional[str]:
+    """Describe why a live PID cannot be proven to be this worker."""
+    if not pid or not _pid_alive(pid):
+        return None
+    if expected_started_at is None:
+        return "missing_recorded_birth_time"
+    actual_started_at = _process_started_at(pid)
+    if actual_started_at is None:
+        return "unreadable_process_birth_time"
+    if actual_started_at != float(expected_started_at):
+        return "process_birth_time_mismatch"
+    return None
+
+
+def _record_worker_identity_alert(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    pid: int,
+    recovery_path: str,
+    identity_issue: str,
+) -> None:
+    """Persist one operator-visible identity alert per worker generation."""
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND run_id IS ? "
+        "AND kind='worker_identity_unverifiable' LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    if existing is None:
+        _append_event(
+            conn,
+            task_id,
+            "worker_identity_unverifiable",
+            {
+                "worker_pid": int(pid),
+                "recovery_path": recovery_path,
+                "identity_issue": identity_issue,
+                "operator_action_required": True,
+            },
+            run_id=run_id,
+        )
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -4380,6 +4435,16 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        identity_issue = _live_process_identity_issue(
+            pid, row["worker_process_started_at"]
+        )
+        if identity_issue:
+            with write_txn(conn):
+                _record_worker_identity_alert(
+                    conn, tid, row["current_run_id"], pid,
+                    "enforce_max_runtime", identity_issue,
+                )
+            continue
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -4520,6 +4585,17 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        identity_issue = lock.startswith(host_prefix) and _live_process_identity_issue(
+            pid, row["worker_process_started_at"]
+        )
+        if identity_issue:
+            with write_txn(conn):
+                _record_worker_identity_alert(
+                    conn, tid, row["current_run_id"], int(pid),
+                    "detect_stale_running", identity_issue,
+                )
+            continue
+
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -4638,7 +4714,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_process_started_at, claim_lock FROM tasks "
+            "SELECT id, current_run_id, worker_pid, worker_process_started_at, "
+            "claim_lock FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -4646,6 +4723,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
+                continue
+            identity_issue = _live_process_identity_issue(
+                row["worker_pid"], row["worker_process_started_at"]
+            )
+            if identity_issue:
+                _record_worker_identity_alert(
+                    conn, row["id"], row["current_run_id"],
+                    int(row["worker_pid"]), "detect_crashed_workers",
+                    identity_issue,
+                )
                 continue
             if not _same_process(row["worker_pid"], row["worker_process_started_at"]):
                 # A live mismatched PID belongs to another process. It is not
