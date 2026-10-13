@@ -30,17 +30,51 @@ def test_entity_link_migration_preserves_existing_data_and_integrity(tmp_path):
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(kb.SCHEMA_SQL)
-    conn.execute(
+    # Build the pre-entity-link shape directly. Using the current SCHEMA_SQL
+    # here would only exercise an idempotent reopen of the new schema, not an
+    # upgrade of an existing Kanban database.
+    conn.executescript("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        );
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        );
+    """)
+    legacy_tasks = [
+        ("t_legacy_1", "legacy one", "todo", 1, "scratch"),
+        ("t_legacy_2", "legacy two", "done", 2, "scratch"),
+    ]
+    conn.executemany(
         "INSERT INTO tasks (id,title,status,created_at,workspace_kind) VALUES (?,?,?,?,?)",
-        ("t_legacy", "legacy", "todo", 1, "scratch"),
+        legacy_tasks,
     )
     conn.commit()
     conn.close()
 
     kb.init_db(db_path)
+    kb.init_db(db_path)
     with kb.connect(db_path) as migrated:
-        assert migrated.execute("SELECT title FROM tasks WHERE id='t_legacy'").fetchone()[0] == "legacy"
+        assert [tuple(row) for row in migrated.execute(
+            "SELECT id,title,status,created_at,workspace_kind FROM tasks ORDER BY id"
+        )] == legacy_tasks
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute(
@@ -145,7 +179,8 @@ def test_detach_is_local_idempotent_and_board_isolated(boards):
         ) is True
         with pytest.raises(kb.EntityLinkIdempotencyConflict):
             kb.detach_entity_link(
-                conn, board_slug="default", task_id=boards, link_id="el_other",
+                conn, board_slug="default", task_id=boards,
+                link_id="el_00000000000000000000000000000000",
                 actor="tester", idempotency_key="detach-1",
             )
 
@@ -267,6 +302,53 @@ def test_snapshot_string_length_boundary_accepts_31_and_rejects_32(boards):
             conn, board_slug="default", task_id=boards, link_id=accepted.link_id,
         ).display_snapshot == {"label": "x" * 31}
         assert len(kb.list_events(conn, boards)) == before_events
+
+
+@pytest.mark.parametrize("field,value", [
+    ("actor", "Authorization: Bearer abc.def"),
+    ("actor", "person@example.com"),
+    ("idempotency_key", "confirmation-token-123"),
+])
+def test_attach_rejects_sensitive_metadata_fields(boards, field, value):
+    kwargs = {
+        "board_slug": "default", "task_id": boards,
+        "entity_type": "contact", "external_id": "93",
+        "relation_role": "context", "created_by": "tester",
+        "idempotency_key": "safe-key",
+    }
+    kwargs["created_by" if field == "actor" else field] = value
+    with kb.connect(board="default") as conn:
+        with pytest.raises(ValueError, match="prohibited sensitive material"):
+            kb.attach_entity_link(conn, **kwargs)
+        assert kb.list_entity_links(
+            conn, board_slug="default", task_id=boards,
+        ) == []
+
+
+def test_resolver_rejects_sensitive_version_and_invalid_link_id(boards):
+    with kb.connect(board="default") as conn:
+        link = kb.attach_entity_link(
+            conn, board_slug="default", task_id=boards, entity_type="contact",
+            external_id="94", relation_role="context", created_by="tester",
+            idempotency_key="version-seed",
+        )
+        with pytest.raises(kb.EntityLinkResolutionError) as exc:
+            kb.resolve_entity_link(
+                conn, board_slug="default", task_id=boards, link_id=link.link_id,
+                resolver=lambda _link, _refresh: {
+                    "verification_state": "verified",
+                    "last_seen_version": "Authorization: Bearer abc.def",
+                },
+            )
+        assert exc.value.code == "remote_contract_mismatch"
+        assert kb.get_entity_link(
+            conn, board_slug="default", task_id=boards, link_id=link.link_id,
+        ).verification_state == "unverified"
+        with pytest.raises(ValueError, match="opaque entity-link ID"):
+            kb.get_entity_link(
+                conn, board_slug="default", task_id=boards,
+                link_id="Authorization: Bearer abc.def",
+            )
 
 
 def _seed_same_task_on_other(task_id: str) -> None:

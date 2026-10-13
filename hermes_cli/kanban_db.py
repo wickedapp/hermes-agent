@@ -107,6 +107,7 @@ VALID_ENTITY_VERIFICATION_STATES = frozenset({
     "unverified", "verified", "missing", "forbidden", "unavailable",
 })
 _ENTITY_EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
+_ENTITY_LINK_ID_RE = re.compile(r"^el_[0-9a-f]{32}$")
 _ENTITY_SNAPSHOT_KEYS = frozenset({
     "label", "reference", "status", "priority", "amount", "currency",
     "updated_at",
@@ -1539,6 +1540,31 @@ def _entity_request_fingerprint(operation: str, **fields: str) -> str:
     )
 
 
+def _validate_entity_safe_text(value: Any, field: str, *, max_length: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be text")
+    text = value.strip()
+    if not text or len(text) > max_length or "\n" in text or "\r" in text:
+        raise ValueError(f"{field} must be 1-{max_length} characters of single-line text")
+    if (
+        _ENTITY_SENSITIVE_VALUE_RE.search(text)
+        or _ENTITY_EMAIL_RE.search(text)
+        or _ENTITY_PHONE_RE.search(text)
+        or _ENTITY_ADDRESS_RE.search(text)
+        or _ENTITY_UNIT_OR_POSTCODE_RE.search(text)
+        or _ENTITY_JWT_RE.search(text)
+        or _ENTITY_AWS_ACCESS_KEY_RE.search(text)
+    ):
+        raise ValueError(f"{field} contains prohibited sensitive material")
+    return text
+
+
+def _validate_entity_link_id(link_id: Any) -> str:
+    if not isinstance(link_id, str) or not _ENTITY_LINK_ID_RE.fullmatch(link_id):
+        raise ValueError("link_id must be an opaque entity-link ID")
+    return link_id
+
+
 def _validate_entity_snapshot(snapshot: Optional[dict[str, Any]]) -> Optional[str]:
     if snapshot is None:
         return None
@@ -1591,12 +1617,8 @@ def attach_entity_link(
     entity_type, external_id, relation_role = _validate_entity_link_fields(
         entity_type=entity_type, external_id=external_id, relation_role=relation_role,
     )
-    actor = str(created_by).strip()
-    key = str(idempotency_key).strip()
-    if not actor:
-        raise ValueError("created_by is required")
-    if not key:
-        raise ValueError("idempotency_key is required")
+    actor = _validate_entity_safe_text(created_by, "created_by", max_length=128)
+    key = _validate_entity_safe_text(idempotency_key, "idempotency_key", max_length=256)
     fingerprint = _entity_request_fingerprint(
         "attach", task_id=task_id, provider=ENTITY_LINK_PROVIDER, actor=actor,
         entity_type=entity_type, external_id=external_id, relation_role=relation_role,
@@ -1668,6 +1690,7 @@ def get_entity_link(
     conn: sqlite3.Connection, *, board_slug: str, task_id: str, link_id: str,
 ) -> Optional[TaskEntityLink]:
     slug = _assert_entity_link_board(conn, board_slug)
+    link_id = _validate_entity_link_id(link_id)
     row = conn.execute(
         "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? AND link_id=?",
         (slug, task_id, link_id),
@@ -1682,10 +1705,9 @@ def detach_entity_link(
 ) -> bool:
     """Remove only the local link. A receipt makes identical retries idempotent."""
     slug = _assert_entity_link_board(conn, board_slug)
-    actor = str(actor).strip()
-    key = str(idempotency_key).strip()
-    if not actor or not key:
-        raise ValueError("actor and idempotency_key are required")
+    link_id = _validate_entity_link_id(link_id)
+    actor = _validate_entity_safe_text(actor, "actor", max_length=128)
+    key = _validate_entity_safe_text(idempotency_key, "idempotency_key", max_length=256)
     fingerprint = _entity_request_fingerprint(
         "detach", task_id=task_id, link_id=link_id, actor=actor,
     )
@@ -1728,12 +1750,15 @@ def _update_entity_link_verification(
 ) -> TaskEntityLink:
     """Storage-only verification interface; it never reads CRM or changes tasks."""
     slug = _assert_entity_link_board(conn, board_slug)
+    link_id = _validate_entity_link_id(link_id)
     if verification_state not in VALID_ENTITY_VERIFICATION_STATES:
         raise ValueError(
             f"verification_state must be one of {sorted(VALID_ENTITY_VERIFICATION_STATES)}"
         )
-    if last_seen_version is not None and len(last_seen_version) > 256:
-        raise ValueError("last_seen_version exceeds 256 characters")
+    if last_seen_version is not None:
+        last_seen_version = _validate_entity_safe_text(
+            last_seen_version, "last_seen_version", max_length=256,
+        )
     snapshot_json = _validate_entity_snapshot(display_snapshot)
     now = int(time.time())
     with write_txn(conn):
