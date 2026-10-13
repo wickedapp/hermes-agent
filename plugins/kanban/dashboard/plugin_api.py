@@ -565,6 +565,115 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
 
 
+class AttachEntityLinkBody(BaseModel):
+    entity_type: str
+    external_id: str
+    relation_role: str
+    idempotency_key: str
+    actor: str = "dashboard"
+
+
+class DetachEntityLinkBody(BaseModel):
+    idempotency_key: str
+    actor: str = "dashboard"
+
+
+class ResolveEntityLinkBody(BaseModel):
+    refresh: bool = False
+
+
+@router.get("/tasks/{task_id}/entity-links")
+def list_entity_links(task_id: str, board: str = Query(...)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"links": [asdict(link) for link in kanban_db.list_entity_links(
+            conn, board_slug=board, task_id=task_id,
+        )]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.get("/tasks/{task_id}/entity-links/{link_id}")
+def get_entity_link(task_id: str, link_id: str, board: str = Query(...)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        link = kanban_db.get_entity_link(
+            conn, board_slug=board, task_id=task_id, link_id=link_id,
+        )
+        if link is None:
+            raise HTTPException(status_code=404, detail="entity link not found")
+        return {"link": asdict(link)}
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/entity-links")
+def attach_entity_link(task_id: str, payload: AttachEntityLinkBody, board: str = Query(...)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        link = kanban_db.attach_entity_link(
+            conn, board_slug=board, task_id=task_id,
+            entity_type=payload.entity_type, external_id=payload.external_id,
+            relation_role=payload.relation_role, created_by=payload.actor,
+            idempotency_key=payload.idempotency_key,
+        )
+        return {"link": asdict(link)}
+    except kanban_db.EntityLinkIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/entity-links/{link_id}/detach")
+def detach_entity_link(
+    task_id: str, link_id: str, payload: DetachEntityLinkBody,
+    board: str = Query(...),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"detached": kanban_db.detach_entity_link(
+            conn, board_slug=board, task_id=task_id, link_id=link_id,
+            actor=payload.actor, idempotency_key=payload.idempotency_key,
+        ), "link_id": link_id}
+    except kanban_db.EntityLinkIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/entity-links/{link_id}/resolve")
+def resolve_entity_link(
+    task_id: str, link_id: str, payload: ResolveEntityLinkBody,
+    board: str = Query(...),
+):
+    """Resolve through a registered read adapter; core ships no live adapter."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        link = kanban_db.resolve_entity_link(
+            conn, board_slug=board, task_id=task_id, link_id=link_id,
+            refresh=payload.refresh,
+        )
+        return {"link": asdict(link)}
+    except kanban_db.EntityLinkResolutionError as exc:
+        http_code = 501 if exc.code == "capability_unavailable" else 502
+        raise HTTPException(status_code=http_code, detail={"code": exc.code})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)

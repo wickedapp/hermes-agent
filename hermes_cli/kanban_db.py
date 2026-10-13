@@ -83,7 +83,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -97,6 +97,52 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+ENTITY_LINK_PROVIDER = "kcc_crm"
+VALID_ENTITY_TYPES = frozenset({
+    "customer", "contact", "lead", "proposal", "estimate", "invoice",
+    "payment", "ticket",
+})
+VALID_ENTITY_RELATION_ROLES = frozenset({"primary", "context", "result"})
+VALID_ENTITY_VERIFICATION_STATES = frozenset({
+    "unverified", "verified", "missing", "forbidden", "unavailable",
+})
+_ENTITY_EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
+_ENTITY_SNAPSHOT_KEYS = frozenset({
+    "label", "reference", "status", "priority", "amount", "currency",
+    "updated_at",
+})
+_ENTITY_SNAPSHOT_MAX_BYTES = 4096
+_ENTITY_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(authorization|bearer\s+[a-z0-9._~+/=-]+|api[_ -]?key|"
+    r"access[_ -]?token|refresh[_ -]?token|confirmation[_ -]?(token|code)|"
+    r"raw[_ -]?(http|response)|http/\d(?:\.\d)?|set-cookie|ticket[_ -]?body|"
+    r"document[_ -]?(body|content)|email[_ -]?body|street|avenue|postal[_ -]?code|"
+    r"(?:secret|token|password|credential|nonce)(?:[_ -]+[a-z0-9][a-z0-9._~+/=-]*)?|"
+    r"\b(?:sk|pk)[-_](?:live|test)(?:[-_][a-z0-9._~+/=-]*)?)"
+)
+_ENTITY_EMAIL_RE = re.compile(r"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b")
+_ENTITY_PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\s().-]*){7,}(?!\d)")
+_ENTITY_ADDRESS_RE = re.compile(
+    r"(?i)\b\d{1,6}[a-z]?\s+(?:[a-z0-9.'-]+\s+){0,6}"
+    r"(?:st(?:reet)?|rd|road|ave(?:nue)?|ln|lane|blvd|boulevard|dr(?:ive)?|"
+    r"ct|court|way|pl|place|pkwy|parkway)\b"
+)
+_ENTITY_UNIT_OR_POSTCODE_RE = re.compile(
+    r"(?i)(?:\b(?:apt|apartment|suite|unit)\s*[#a-z0-9-]+\b|"
+    r"\B#\s*[a-z0-9-]+\b|\b\d{5}(?:-\d{4})?\b|"
+    r"\b[a-z]{1,2}\d[a-z\d]?\s*\d[a-z]{2}\b|"
+    r"\bp\.?\s*o\.?\s+box\s+[a-z0-9-]+\b|"
+    r"\bpost\s+office\s+box\s+[a-z0-9-]+\b)"
+)
+_ENTITY_JWT_RE = re.compile(
+    r"\beyJ[a-zA-Z0-9_-]{5,}\.[a-zA-Z0-9_-]{5,}\.[a-zA-Z0-9_-]{5,}\b"
+)
+_ENTITY_AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+VALID_ENTITY_RESOLUTION_ERRORS = frozenset({
+    "invalid_reference", "not_found", "permission_denied",
+    "authentication_failed", "capability_unavailable", "rate_limited",
+    "transient_remote_error", "remote_contract_mismatch",
+})
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -801,6 +847,62 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class TaskEntityLink:
+    link_id: str
+    board_slug: str
+    task_id: str
+    provider: str
+    entity_type: str
+    external_id: str
+    relation_role: str
+    created_by: str
+    created_at: int
+    verified_at: Optional[int]
+    verification_state: str
+    last_seen_version: Optional[str]
+    display_snapshot: Optional[dict[str, Any]]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "TaskEntityLink":
+        snapshot = json.loads(row["display_snapshot"]) if row["display_snapshot"] else None
+        return cls(
+            link_id=row["link_id"], board_slug=row["board_slug"],
+            task_id=row["task_id"], provider=row["provider"],
+            entity_type=row["entity_type"], external_id=row["external_id"],
+            relation_role=row["relation_role"], created_by=row["created_by"],
+            created_at=row["created_at"], verified_at=row["verified_at"],
+            verification_state=row["verification_state"],
+            last_seen_version=row["last_seen_version"], display_snapshot=snapshot,
+        )
+
+
+class EntityLinkIdempotencyConflict(ValueError):
+    """An entity-link idempotency key was reused for another request."""
+
+
+class EntityLinkResolutionError(RuntimeError):
+    """Closed, sanitized failure from an entity-link read resolver."""
+
+    def __init__(self, code: str, message: Optional[str] = None):
+        if code not in VALID_ENTITY_RESOLUTION_ERRORS:
+            code = "remote_contract_mismatch"
+        self.code = code
+        super().__init__(message or code)
+
+
+_ENTITY_LINK_RESOLVERS: dict[str, Callable[[TaskEntityLink, bool], dict[str, Any]]] = {}
+
+
+def register_entity_link_resolver(
+    provider: str, resolver: Callable[[TaskEntityLink, bool], dict[str, Any]],
+) -> None:
+    """Register an in-process read-only resolver adapter for a provider."""
+    if provider != ENTITY_LINK_PROVIDER or not callable(resolver):
+        raise ValueError("unsupported entity-link resolver")
+    _ENTITY_LINK_RESOLVERS[provider] = resolver
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -933,6 +1035,37 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_entity_links (
+    link_id              TEXT PRIMARY KEY,
+    board_slug           TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    provider             TEXT NOT NULL CHECK (provider = 'kcc_crm'),
+    entity_type          TEXT NOT NULL CHECK (entity_type IN ('customer','contact','lead','proposal','estimate','invoice','payment','ticket')),
+    external_id          TEXT NOT NULL CHECK (external_id GLOB '[0-9]*' AND external_id NOT GLOB '*[^0-9]*' AND CAST(external_id AS INTEGER) > 0),
+    relation_role        TEXT NOT NULL CHECK (relation_role IN ('primary','context','result')),
+    created_by           TEXT NOT NULL,
+    created_at           INTEGER NOT NULL,
+    verified_at          INTEGER,
+    verification_state   TEXT NOT NULL DEFAULT 'unverified' CHECK (verification_state IN ('unverified','verified','missing','forbidden','unavailable')),
+    last_seen_version    TEXT,
+    display_snapshot     TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    UNIQUE (board_slug, task_id, provider, entity_type, external_id, relation_role)
+);
+
+CREATE TABLE IF NOT EXISTS entity_link_idempotency (
+    board_slug          TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    operation           TEXT NOT NULL CHECK (operation IN ('attach','detach')),
+    request_fingerprint TEXT NOT NULL,
+    task_id             TEXT NOT NULL,
+    link_id             TEXT NOT NULL,
+    actor               TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    PRIMARY KEY (board_slug, idempotency_key),
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -942,6 +1075,7 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_entity_links_task      ON task_entity_links(board_slug, task_id, created_at);
 """
 
 
@@ -1057,8 +1191,18 @@ def connect(
                 # process are cheap. The lock prevents same-process dispatcher
                 # threads from racing through the additive ALTER TABLE pass with
                 # stale PRAGMA snapshots during gateway startup.
-                conn.executescript(SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
+                try:
+                    # sqlite3.executescript() implicitly commits before running,
+                    # so embed BEGIN in the script and leave the transaction open
+                    # through the additive migration pass. A fresh schema and an
+                    # upgraded legacy schema therefore become visible together.
+                    conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL)
+                    _migrate_add_optional_columns(conn)
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
                 _INITIALIZED_PATHS.add(resolved)
     except Exception:
         conn.close()
@@ -1273,7 +1417,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
-        with write_txn(conn):
+        # connect() now wraps the full schema + migration pass in one
+        # IMMEDIATE transaction. Preserve direct-call compatibility for
+        # tests/maintenance callers that invoke this helper independently.
+        txn = contextlib.nullcontext(conn) if conn.in_transaction else write_txn(conn)
+        with txn:
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -1349,6 +1497,323 @@ def write_txn(conn: sqlite3.Connection):
         raise
     else:
         conn.execute("COMMIT")
+
+
+# ---------------------------------------------------------------------------
+# Provider-neutral task entity links
+# ---------------------------------------------------------------------------
+
+def _assert_entity_link_board(conn: sqlite3.Connection, board_slug: str) -> str:
+    slug = _normalize_board_slug(board_slug)
+    if not slug:
+        raise ValueError("board_slug is required")
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    if db_file:
+        actual = Path(db_file).resolve()
+        expected = kanban_db_path(board=slug).resolve()
+        if actual != expected:
+            raise ValueError(f"connection is not scoped to board {slug!r}")
+    return slug
+
+
+def _validate_entity_link_fields(
+    *, entity_type: str, external_id: str, relation_role: str,
+) -> tuple[str, str, str]:
+    if entity_type not in VALID_ENTITY_TYPES:
+        raise ValueError(f"entity_type must be one of {sorted(VALID_ENTITY_TYPES)}")
+    if not isinstance(external_id, str) or not _ENTITY_EXTERNAL_ID_RE.fullmatch(external_id):
+        raise ValueError("external_id must be an exact positive decimal text token")
+    if not any(ch != "0" for ch in external_id):
+        raise ValueError("external_id must be greater than zero")
+    if relation_role not in VALID_ENTITY_RELATION_ROLES:
+        raise ValueError(
+            f"relation_role must be one of {sorted(VALID_ENTITY_RELATION_ROLES)}"
+        )
+    return entity_type, external_id, relation_role
+
+
+def _entity_request_fingerprint(operation: str, **fields: str) -> str:
+    return json.dumps(
+        {"operation": operation, **fields}, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True,
+    )
+
+
+def _validate_entity_snapshot(snapshot: Optional[dict[str, Any]]) -> Optional[str]:
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, dict):
+        raise ValueError("display_snapshot must be an object or null")
+    unknown = set(snapshot) - _ENTITY_SNAPSHOT_KEYS
+    if unknown:
+        raise ValueError(f"display_snapshot contains unsupported fields: {sorted(unknown)}")
+    for key, value in snapshot.items():
+        if value is not None and not isinstance(value, (str, int, float, bool)):
+            raise ValueError(f"display_snapshot.{key} must be a scalar or null")
+        if key in {"label", "reference", "status", "priority", "currency"} and value is not None and not isinstance(value, str):
+            raise ValueError(f"display_snapshot.{key} must be display text or null")
+        if key == "amount" and value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+            raise ValueError("display_snapshot.amount must be numeric or null")
+        if isinstance(value, str) and len(value) >= 32:
+            raise ValueError(f"display_snapshot.{key} exceeds 31 characters")
+        if isinstance(value, str):
+            if "\n" in value or "\r" in value:
+                raise ValueError(f"display_snapshot.{key} must be single-line display text")
+            if (
+                _ENTITY_SENSITIVE_VALUE_RE.search(value)
+                or _ENTITY_EMAIL_RE.search(value)
+                or _ENTITY_PHONE_RE.search(value)
+                or _ENTITY_ADDRESS_RE.search(value)
+                or _ENTITY_UNIT_OR_POSTCODE_RE.search(value)
+                or _ENTITY_JWT_RE.search(value)
+                or _ENTITY_AWS_ACCESS_KEY_RE.search(value)
+            ):
+                raise ValueError(f"display_snapshot.{key} contains prohibited sensitive material")
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(encoded.encode("utf-8")) > _ENTITY_SNAPSHOT_MAX_BYTES:
+        raise ValueError("display_snapshot exceeds 4096 bytes")
+    return encoded
+
+
+def attach_entity_link(
+    conn: sqlite3.Connection,
+    *,
+    board_slug: str,
+    task_id: str,
+    entity_type: str,
+    external_id: str,
+    relation_role: str,
+    created_by: str,
+    idempotency_key: str,
+) -> TaskEntityLink:
+    """Attach one local external reference; no provider call is performed."""
+    slug = _assert_entity_link_board(conn, board_slug)
+    entity_type, external_id, relation_role = _validate_entity_link_fields(
+        entity_type=entity_type, external_id=external_id, relation_role=relation_role,
+    )
+    actor = str(created_by).strip()
+    key = str(idempotency_key).strip()
+    if not actor:
+        raise ValueError("created_by is required")
+    if not key:
+        raise ValueError("idempotency_key is required")
+    fingerprint = _entity_request_fingerprint(
+        "attach", task_id=task_id, provider=ENTITY_LINK_PROVIDER, actor=actor,
+        entity_type=entity_type, external_id=external_id, relation_role=relation_role,
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        receipt = conn.execute(
+            "SELECT * FROM entity_link_idempotency WHERE board_slug=? AND idempotency_key=?",
+            (slug, key),
+        ).fetchone()
+        if receipt:
+            if receipt["operation"] != "attach" or receipt["request_fingerprint"] != fingerprint:
+                raise EntityLinkIdempotencyConflict("idempotency_conflict")
+            row = conn.execute(
+                "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? AND link_id=?",
+                (slug, task_id, receipt["link_id"]),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("persisted_result_mismatch")
+            return TaskEntityLink.from_row(row)
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            raise ValueError(f"task not found: {task_id}")
+        row = conn.execute(
+            "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? AND provider=? "
+            "AND entity_type=? AND external_id=? AND relation_role=?",
+            (slug, task_id, ENTITY_LINK_PROVIDER, entity_type, external_id, relation_role),
+        ).fetchone()
+        if row is None:
+            link_id = "el_" + secrets.token_hex(16)
+            conn.execute(
+                "INSERT INTO task_entity_links "
+                "(link_id,board_slug,task_id,provider,entity_type,external_id,relation_role,created_by,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (link_id, slug, task_id, ENTITY_LINK_PROVIDER, entity_type,
+                 external_id, relation_role, actor, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM task_entity_links WHERE link_id=?", (link_id,)
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+                (task_id, "task.entity_link.attached", json.dumps({
+                    "link_id": link_id, "actor": actor, "provider": ENTITY_LINK_PROVIDER,
+                    "entity_type": entity_type, "external_id": external_id,
+                    "relation_role": relation_role,
+                }), now),
+            )
+        conn.execute(
+            "INSERT INTO entity_link_idempotency "
+            "(board_slug,idempotency_key,operation,request_fingerprint,task_id,link_id,actor,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (slug, key, "attach", fingerprint, task_id, row["link_id"], actor, now),
+        )
+        return TaskEntityLink.from_row(row)
+
+
+def list_entity_links(
+    conn: sqlite3.Connection, *, board_slug: str, task_id: str,
+) -> list[TaskEntityLink]:
+    slug = _assert_entity_link_board(conn, board_slug)
+    rows = conn.execute(
+        "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? "
+        "ORDER BY created_at, link_id", (slug, task_id),
+    ).fetchall()
+    return [TaskEntityLink.from_row(row) for row in rows]
+
+
+def get_entity_link(
+    conn: sqlite3.Connection, *, board_slug: str, task_id: str, link_id: str,
+) -> Optional[TaskEntityLink]:
+    slug = _assert_entity_link_board(conn, board_slug)
+    row = conn.execute(
+        "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? AND link_id=?",
+        (slug, task_id, link_id),
+    ).fetchone()
+    return TaskEntityLink.from_row(row) if row else None
+
+
+def detach_entity_link(
+    conn: sqlite3.Connection,
+    *, board_slug: str, task_id: str, link_id: str, actor: str,
+    idempotency_key: str,
+) -> bool:
+    """Remove only the local link. A receipt makes identical retries idempotent."""
+    slug = _assert_entity_link_board(conn, board_slug)
+    actor = str(actor).strip()
+    key = str(idempotency_key).strip()
+    if not actor or not key:
+        raise ValueError("actor and idempotency_key are required")
+    fingerprint = _entity_request_fingerprint(
+        "detach", task_id=task_id, link_id=link_id, actor=actor,
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        receipt = conn.execute(
+            "SELECT * FROM entity_link_idempotency WHERE board_slug=? AND idempotency_key=?",
+            (slug, key),
+        ).fetchone()
+        if receipt:
+            if receipt["operation"] != "detach" or receipt["request_fingerprint"] != fingerprint:
+                raise EntityLinkIdempotencyConflict("idempotency_conflict")
+            return True
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            raise ValueError(f"task not found: {task_id}")
+        conn.execute(
+            "DELETE FROM task_entity_links WHERE board_slug=? AND task_id=? AND link_id=?",
+            (slug, task_id, link_id),
+        )
+        conn.execute(
+            "INSERT INTO entity_link_idempotency "
+            "(board_slug,idempotency_key,operation,request_fingerprint,task_id,link_id,actor,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (slug, key, "detach", fingerprint, task_id, link_id, actor, now),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+            (task_id, "task.entity_link.detached", json.dumps({
+                "link_id": link_id, "actor": actor,
+            }), now),
+        )
+    return True
+
+
+def _update_entity_link_verification(
+    conn: sqlite3.Connection,
+    *, board_slug: str, task_id: str, link_id: str,
+    verification_state: str, last_seen_version: Optional[str] = None,
+    display_snapshot: Optional[dict[str, Any]] = None,
+) -> TaskEntityLink:
+    """Storage-only verification interface; it never reads CRM or changes tasks."""
+    slug = _assert_entity_link_board(conn, board_slug)
+    if verification_state not in VALID_ENTITY_VERIFICATION_STATES:
+        raise ValueError(
+            f"verification_state must be one of {sorted(VALID_ENTITY_VERIFICATION_STATES)}"
+        )
+    if last_seen_version is not None and len(last_seen_version) > 256:
+        raise ValueError("last_seen_version exceeds 256 characters")
+    snapshot_json = _validate_entity_snapshot(display_snapshot)
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT verification_state, verified_at FROM task_entity_links "
+            "WHERE board_slug=? AND task_id=? AND link_id=?",
+            (slug, task_id, link_id),
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"entity link not found: {link_id}")
+        allowed = {
+            "unverified": {"verified", "missing", "forbidden", "unavailable"},
+            "verified": {"missing", "forbidden", "unavailable"},
+            "missing": {"verified"}, "forbidden": {"verified"},
+            "unavailable": {"verified"},
+        }
+        if verification_state != current["verification_state"] and verification_state not in allowed[current["verification_state"]]:
+            raise ValueError(
+                f"invalid verification transition: {current['verification_state']} -> {verification_state}"
+            )
+        verified_at = now if verification_state == "verified" else current["verified_at"]
+        changed = conn.execute(
+            "UPDATE task_entity_links SET verified_at=?, verification_state=?, "
+            "last_seen_version=?, display_snapshot=? "
+            "WHERE board_slug=? AND task_id=? AND link_id=?",
+            (verified_at, verification_state, last_seen_version, snapshot_json,
+             slug, task_id, link_id),
+        ).rowcount
+        if not changed:
+            raise ValueError(f"entity link not found: {link_id}")
+        conn.execute(
+            "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+            (task_id, "task.entity_link.verification_changed", json.dumps({
+                "link_id": link_id, "verification_state": verification_state,
+            }), now),
+        )
+        row = conn.execute(
+            "SELECT * FROM task_entity_links WHERE link_id=?", (link_id,)
+        ).fetchone()
+        return TaskEntityLink.from_row(row)
+
+
+def resolve_entity_link(
+    conn: sqlite3.Connection,
+    *, board_slug: str, task_id: str, link_id: str, refresh: bool = False,
+    resolver: Optional[Callable[[TaskEntityLink, bool], dict[str, Any]]] = None,
+) -> TaskEntityLink:
+    """Resolve through a registered/provided read adapter and persist safe display state.
+
+    No adapter is bundled in core. Without one this fails with the closed
+    ``capability_unavailable`` code and leaves verification state untouched.
+    """
+    link = get_entity_link(
+        conn, board_slug=board_slug, task_id=task_id, link_id=link_id,
+    )
+    if link is None:
+        raise EntityLinkResolutionError("invalid_reference")
+    adapter = resolver or _ENTITY_LINK_RESOLVERS.get(link.provider)
+    if adapter is None:
+        raise EntityLinkResolutionError("capability_unavailable")
+    try:
+        result = adapter(link, bool(refresh))
+    except EntityLinkResolutionError:
+        raise
+    except Exception as exc:
+        raise EntityLinkResolutionError("transient_remote_error") from exc
+    if not isinstance(result, dict):
+        raise EntityLinkResolutionError("remote_contract_mismatch")
+    allowed_keys = {"verification_state", "last_seen_version", "display_snapshot"}
+    if set(result) - allowed_keys or "verification_state" not in result:
+        raise EntityLinkResolutionError("remote_contract_mismatch")
+    try:
+        return _update_entity_link_verification(
+            conn, board_slug=board_slug, task_id=task_id, link_id=link_id,
+            verification_state=result["verification_state"],
+            last_seen_version=result.get("last_seen_version"),
+            display_snapshot=result.get("display_snapshot"),
+        )
+    except ValueError as exc:
+        raise EntityLinkResolutionError("remote_contract_mismatch") from exc
 
 
 # ---------------------------------------------------------------------------

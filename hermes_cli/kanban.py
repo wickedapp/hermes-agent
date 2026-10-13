@@ -222,6 +222,38 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
 
+    # --- provider-neutral entity references ---
+    p_entities = sub.add_parser(
+        "entity-links", help="Attach, detach, and inspect external entity references",
+    )
+    entity_sub = p_entities.add_subparsers(dest="entity_links_action")
+    e_attach = entity_sub.add_parser("attach")
+    e_attach.add_argument("task_id")
+    e_attach.add_argument("entity_type", choices=sorted(kb.VALID_ENTITY_TYPES))
+    e_attach.add_argument("external_id")
+    e_attach.add_argument("relation_role", choices=sorted(kb.VALID_ENTITY_RELATION_ROLES))
+    e_attach.add_argument("--idempotency-key", required=True)
+    e_attach.add_argument("--actor", default=None)
+    e_attach.add_argument("--json", action="store_true")
+    e_detach = entity_sub.add_parser("detach")
+    e_detach.add_argument("task_id")
+    e_detach.add_argument("link_id")
+    e_detach.add_argument("--idempotency-key", required=True)
+    e_detach.add_argument("--actor", default=None)
+    e_detach.add_argument("--json", action="store_true")
+    e_list = entity_sub.add_parser("list")
+    e_list.add_argument("task_id")
+    e_list.add_argument("--json", action="store_true")
+    e_get = entity_sub.add_parser("get")
+    e_get.add_argument("task_id")
+    e_get.add_argument("link_id")
+    e_get.add_argument("--json", action="store_true")
+    e_resolve = entity_sub.add_parser("resolve")
+    e_resolve.add_argument("task_id")
+    e_resolve.add_argument("link_id")
+    e_resolve.add_argument("--refresh", action="store_true")
+    e_resolve.add_argument("--json", action="store_true")
+
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
 
@@ -915,6 +947,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
+        "entity-links": _cmd_entity_links,
         "gc":       _cmd_gc,
     }
     handler = handlers.get(action)
@@ -947,6 +980,62 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+def _entity_link_dict(link: kb.TaskEntityLink) -> dict[str, Any]:
+    return {
+        "link_id": link.link_id, "board_slug": link.board_slug,
+        "task_id": link.task_id, "provider": link.provider,
+        "entity_type": link.entity_type, "external_id": link.external_id,
+        "relation_role": link.relation_role, "created_by": link.created_by,
+        "created_at": link.created_at, "verified_at": link.verified_at,
+        "verification_state": link.verification_state,
+        "last_seen_version": link.last_seen_version,
+        "display_snapshot": link.display_snapshot,
+    }
+
+
+def _cmd_entity_links(args: argparse.Namespace) -> int:
+    action = getattr(args, "entity_links_action", None)
+    board = getattr(args, "board", None)
+    if not board:
+        raise ValueError("entity-links requires explicit --board <slug>")
+    with kb.connect(board=board) as conn:
+        if action == "attach":
+            link = kb.attach_entity_link(
+                conn, board_slug=board, task_id=args.task_id,
+                entity_type=args.entity_type, external_id=args.external_id,
+                relation_role=args.relation_role,
+                created_by=args.actor or _profile_author(),
+                idempotency_key=args.idempotency_key,
+            )
+            data: Any = _entity_link_dict(link)
+        elif action == "detach":
+            data = {"detached": kb.detach_entity_link(
+                conn, board_slug=board, task_id=args.task_id, link_id=args.link_id,
+                actor=args.actor or _profile_author(),
+                idempotency_key=args.idempotency_key,
+            ), "link_id": args.link_id}
+        elif action == "list":
+            data = [_entity_link_dict(link) for link in kb.list_entity_links(
+                conn, board_slug=board, task_id=args.task_id,
+            )]
+        elif action == "get":
+            link = kb.get_entity_link(
+                conn, board_slug=board, task_id=args.task_id, link_id=args.link_id,
+            )
+            if link is None:
+                raise ValueError(f"entity link not found: {args.link_id}")
+            data = _entity_link_dict(link)
+        elif action == "resolve":
+            data = _entity_link_dict(kb.resolve_entity_link(
+                conn, board_slug=board, task_id=args.task_id,
+                link_id=args.link_id, refresh=args.refresh,
+            ))
+        else:
+            raise ValueError("entity-links requires attach, detach, list, get, or resolve")
+    print(json.dumps(data, sort_keys=True) if getattr(args, "json", False) else json.dumps(data, indent=2))
+    return 0
 
 
 # ---------------------------------------------------------------------------
