@@ -14,7 +14,7 @@ from hermes_cli import kanban_db as kb
 
 
 def test_entity_link_migration_preserves_every_task_and_integrity(tmp_path):
-    """Exercise the checked-in pre-feature schema through normal discovery."""
+    """Prove the legacy schema is RED, then migrate it through normal discovery."""
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys=ON")
@@ -34,6 +34,12 @@ def test_entity_link_migration_preserves_every_task_and_integrity(tmp_path):
         legacy_tasks,
     )
     conn.commit()
+    assert conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='task_entity_links'"
+    ).fetchone() is None
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        conn.execute("SELECT link_id FROM task_entity_links").fetchall()
     conn.close()
 
     kb.init_db(db_path)
