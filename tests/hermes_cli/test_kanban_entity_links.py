@@ -49,6 +49,54 @@ def test_entity_link_migration_preserves_every_task_and_integrity(tmp_path):
         ).fetchone()
 
 
+def test_entity_link_migration_is_idempotent_under_concurrent_open(tmp_path):
+    db_path = tmp_path / "legacy-concurrent.db"
+    conn = sqlite3.connect(db_path)
+    schema_fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "kanban"
+        / "pre_entity_links_schema.sql"
+    )
+    conn.executescript(schema_fixture.read_text(encoding="utf-8"))
+    legacy_tasks = [
+        ("t_legacy_1", "legacy one", "todo", 1, "scratch"),
+        ("t_legacy_2", "legacy two", "done", 2, "scratch"),
+    ]
+    conn.executemany(
+        "INSERT INTO tasks (id,title,status,created_at,workspace_kind) VALUES (?,?,?,?,?)",
+        legacy_tasks,
+    )
+    conn.commit()
+    conn.close()
+
+    barrier = threading.Barrier(6)
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            opened = kb.connect(db_path)
+            opened.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    with kb.connect(db_path) as migrated:
+        assert [tuple(row) for row in migrated.execute(
+            "SELECT id,title,status,created_at,workspace_kind FROM tasks ORDER BY id"
+        )] == legacy_tasks
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
 @pytest.fixture
 def boards(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
