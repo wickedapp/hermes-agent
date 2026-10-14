@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
@@ -227,16 +228,23 @@ def _entity_link_scope(args: dict) -> tuple[Optional[str], Optional[str], Option
     board = args.get("board")
     if not task_id or not board:
         return None, None, "task_id and explicit board are required"
+    # Validate caller-controlled scope before comparing it with the trusted
+    # worker pin.  Keep failures closed and non-reflective: tool errors can be
+    # surfaced in model transcripts and must never echo arbitrary input.
+    if not isinstance(board, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9_-]{0,63}", board
+    ):
+        return None, None, "board must be a canonical Kanban board slug"
     ownership_error = _enforce_worker_task_ownership(task_id)
     if ownership_error:
         return None, None, ownership_error
     pinned = os.environ.get("HERMES_KANBAN_BOARD")
     if not pinned:
         return None, None, "entity-link tools require HERMES_KANBAN_BOARD"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", pinned):
+        return None, None, "entity-link worker board pin is invalid"
     if board != pinned:
-        return None, None, tool_error(
-            f"worker is pinned to board {pinned}; refusing board {board}"
-        )
+        return None, None, "entity-link board scope mismatch"
     return task_id, board, None
 
 

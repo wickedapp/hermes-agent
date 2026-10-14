@@ -233,13 +233,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     e_attach.add_argument("external_id")
     e_attach.add_argument("relation_role", choices=sorted(kb.VALID_ENTITY_RELATION_ROLES))
     e_attach.add_argument("--idempotency-key", required=True)
-    e_attach.add_argument("--actor", default=None)
     e_attach.add_argument("--json", action="store_true")
     e_detach = entity_sub.add_parser("detach")
     e_detach.add_argument("task_id")
     e_detach.add_argument("link_id")
     e_detach.add_argument("--idempotency-key", required=True)
-    e_detach.add_argument("--actor", default=None)
     e_detach.add_argument("--json", action="store_true")
     e_list = entity_sub.add_parser("list")
     e_list.add_argument("task_id")
@@ -1008,14 +1006,14 @@ def _cmd_entity_links(args: argparse.Namespace) -> int:
                 conn, board_slug=board, task_id=args.task_id,
                 entity_type=args.entity_type, external_id=args.external_id,
                 relation_role=args.relation_role,
-                created_by=args.actor or _profile_author(),
+                created_by=_profile_author(),
                 idempotency_key=args.idempotency_key,
             )
             data: Any = _entity_link_dict(link)
         elif action == "detach":
             data = {"detached": kb.detach_entity_link(
                 conn, board_slug=board, task_id=args.task_id, link_id=args.link_id,
-                actor=args.actor or _profile_author(),
+                actor=_profile_author(),
                 idempotency_key=args.idempotency_key,
             ), "link_id": args.link_id}
         elif action == "list":

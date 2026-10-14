@@ -46,7 +46,7 @@ from dataclasses import asdict
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -95,12 +95,12 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
         return None
     try:
         normed = kanban_db._normalize_board_slug(board)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid board slug")
     if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
         raise HTTPException(
             status_code=404,
-            detail=f"board {normed!r} does not exist",
+            detail="board does not exist",
         )
     return normed
 
@@ -566,16 +566,18 @@ class CreateTaskBody(BaseModel):
 
 
 class AttachEntityLinkBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     entity_type: str
     external_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9]+$")
     relation_role: str
     idempotency_key: str
-    actor: str = "dashboard"
 
 
 class DetachEntityLinkBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     idempotency_key: str
-    actor: str = "dashboard"
 
 
 class ResolveEntityLinkBody(BaseModel):
@@ -625,7 +627,7 @@ def attach_entity_link(task_id: str, payload: AttachEntityLinkBody, board: str =
         link = kanban_db.attach_entity_link(
             conn, board_slug=board, task_id=task_id,
             entity_type=payload.entity_type, external_id=payload.external_id,
-            relation_role=payload.relation_role, created_by=payload.actor,
+            relation_role=payload.relation_role, created_by="dashboard",
             idempotency_key=payload.idempotency_key,
         )
         return {"link": asdict(link)}
@@ -647,7 +649,7 @@ def detach_entity_link(
     try:
         return {"detached": kanban_db.detach_entity_link(
             conn, board_slug=board, task_id=task_id, link_id=link_id,
-            actor=payload.actor, idempotency_key=payload.idempotency_key,
+            actor="dashboard", idempotency_key=payload.idempotency_key,
         ), "link_id": link_id}
     except kanban_db.EntityLinkIdempotencyConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -676,6 +678,11 @@ def resolve_entity_link(
             "capability_unavailable": 501,
             "not_found": 404,
             "invalid_reference": 400,
+            "permission_denied": 403,
+            "authentication_failed": 401,
+            "rate_limited": 429,
+            "transient_remote_error": 503,
+            "remote_contract_mismatch": 502,
         }.get(exc.code, 502)
         raise HTTPException(status_code=http_code, detail={"code": exc.code})
     except ValueError as exc:

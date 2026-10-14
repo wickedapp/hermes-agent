@@ -529,9 +529,10 @@ def _seed_same_task_on_other(task_id: str) -> None:
         )
 
 
-def test_cli_entity_link_routes_stay_on_explicit_board(boards, capsys):
+def test_cli_entity_link_routes_stay_on_explicit_board(boards, capsys, monkeypatch):
     from hermes_cli.kanban import kanban_command
 
+    monkeypatch.setenv("HERMES_PROFILE", "trusted-cli-profile")
     _seed_same_task_on_other(boards)
     with kb.connect(board="default") as conn:
         link = kb.attach_entity_link(
@@ -540,6 +541,13 @@ def test_cli_entity_link_routes_stay_on_explicit_board(boards, capsys):
             idempotency_key="cli-seed",
         )
     base = dict(kanban_action="entity-links", task_id=boards, json=True)
+    assert kanban_command(argparse.Namespace(
+        **base, board="default", entity_links_action="attach",
+        entity_type="contact", external_id="56", relation_role="context",
+        actor="forged-caller", idempotency_key="cli-trusted-actor",
+    )) == 0
+    attached = json.loads(capsys.readouterr().out)
+    assert attached["created_by"] == "trusted-cli-profile"
     assert kanban_command(argparse.Namespace(
         **base, board="other", entity_links_action="list",
     )) == 0
@@ -584,7 +592,7 @@ def test_structured_tools_preserve_worker_pin_for_entity_link_routes(boards, mon
         }),
     ):
         result = json.loads(handler({"board": "other", "task_id": boards, **extra}))
-        assert "pinned to board default" in result["error"]
+        assert result["error"] == "entity-link board scope mismatch"
     result = json.loads(tools._handle_get_entity_link({
         "board": "default", "task_id": boards, "link_id": link.link_id,
     }))
@@ -628,6 +636,38 @@ def test_structured_tools_require_pin_and_ignore_caller_actor(boards, monkeypatc
     }
 
 
+def test_structured_entity_link_tools_reject_sensitive_board_without_reflection(
+    boards, monkeypatch,
+):
+    from tools import kanban_tools as tools
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", boards)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    sensitive = "Authorization: Bearer secret-token"
+    for handler, extra in (
+        (tools._handle_attach_entity_link, {
+            "entity_type": "contact", "external_id": "1",
+            "relation_role": "context", "idempotency_key": "attach-key",
+        }),
+        (tools._handle_detach_entity_link, {
+            "link_id": "el_0123456789abcdef0123456789abcdef",
+            "idempotency_key": "detach-key",
+        }),
+        (tools._handle_list_entity_links, {}),
+        (tools._handle_get_entity_link, {
+            "link_id": "el_0123456789abcdef0123456789abcdef",
+        }),
+        (tools._handle_resolve_entity_link, {
+            "link_id": "el_0123456789abcdef0123456789abcdef",
+        }),
+    ):
+        result = json.loads(handler({
+            "board": sensitive, "task_id": boards, **extra,
+        }))
+        assert result["error"] == "board must be a canonical Kanban board slug"
+        assert sensitive not in json.dumps(result)
+
+
 def test_dashboard_entity_link_routes_are_board_isolated(boards):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -647,7 +687,15 @@ def test_dashboard_entity_link_routes_are_board_isolated(boards):
               "relation_role": "result", "idempotency_key": "api-attach"},
     )
     assert attached.status_code == 200
+    assert attached.json()["link"]["created_by"] == "dashboard"
     link_id = attached.json()["link"]["link_id"]
+    forged_actor = client.post(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links?board=default",
+        json={"entity_type": "invoice", "external_id": "103",
+              "relation_role": "result", "idempotency_key": "api-forged-actor",
+              "actor": "forged-caller"},
+    )
+    assert forged_actor.status_code == 422
     second = client.post(
         f"/api/plugins/kanban/tasks/{boards}/entity-links?board=default",
         json={"entity_type": "invoice", "external_id": "102",
@@ -671,6 +719,13 @@ def test_dashboard_entity_link_routes_are_board_isolated(boards):
               "relation_role": "result", "idempotency_key": "api-oversized"},
     )
     assert oversized.status_code == 422
+    sensitive_board = "Authorization: Bearer secret-token"
+    invalid_board = client.get(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links",
+        params={"board": sensitive_board},
+    )
+    assert invalid_board.status_code == 400
+    assert sensitive_board not in invalid_board.text
     listed = client.get(f"/api/plugins/kanban/tasks/{boards}/entity-links?board=other")
     assert listed.status_code == 200 and listed.json()["links"] == []
     assert client.get(
