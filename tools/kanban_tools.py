@@ -154,9 +154,9 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
         return None
     if tid != env_tid:
         return tool_error(
-            f"worker is scoped to task {env_tid}; refusing to mutate "
-            f"{tid}. Use kanban_comment to hand off information to other "
-            f"tasks, or kanban_create to spawn follow-up work."
+            "worker is scoped to its assigned task; refusing to mutate a "
+            "different task_id. Use kanban_comment to hand off information "
+            "to other tasks, or kanban_create to spawn follow-up work."
         )
     return None
 

@@ -109,6 +109,10 @@ VALID_ENTITY_VERIFICATION_STATES = frozenset({
 })
 _ENTITY_EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
 ENTITY_EXTERNAL_ID_MAX_LENGTH = 64
+# Historical Hermes releases generated shorter IDs, and imported pre-feature
+# databases may contain descriptive opaque IDs.  Keep the accepted alphabet
+# closed and bounded without tying link access to the current generator width.
+_ENTITY_TASK_ID_RE = re.compile(r"^t_[a-z0-9_-]{1,64}$")
 ENTITY_LINK_LIST_DEFAULT_LIMIT = 100
 ENTITY_LINK_LIST_MAX_LIMIT = 100
 _ENTITY_LINK_ID_RE = re.compile(r"^el_[0-9a-f]{32}$")
@@ -1581,6 +1585,13 @@ def _validate_entity_link_id(link_id: Any) -> str:
     return link_id
 
 
+def _validate_entity_task_id(task_id: Any) -> str:
+    """Accept only native opaque task IDs without reflecting rejected input."""
+    if not isinstance(task_id, str) or not _ENTITY_TASK_ID_RE.fullmatch(task_id):
+        raise ValueError("task_id must be an opaque Kanban task ID")
+    return task_id
+
+
 def _validate_entity_snapshot(snapshot: Optional[dict[str, Any]]) -> Optional[str]:
     if snapshot is None:
         return None
@@ -1632,6 +1643,7 @@ def attach_entity_link(
 ) -> TaskEntityLink:
     """Attach one local external reference; no provider call is performed."""
     slug = _assert_entity_link_board(conn, board_slug)
+    task_id = _validate_entity_task_id(task_id)
     entity_type, external_id, relation_role = _validate_entity_link_fields(
         entity_type=entity_type, external_id=external_id, relation_role=relation_role,
     )
@@ -1658,7 +1670,7 @@ def attach_entity_link(
                 raise RuntimeError("persisted_result_mismatch")
             return TaskEntityLink.from_row(row)
         if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
-            raise ValueError(f"task not found: {task_id}")
+            raise ValueError("task not found")
         row = conn.execute(
             "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? AND provider=? "
             "AND entity_type=? AND external_id=? AND relation_role=?",
@@ -1698,6 +1710,7 @@ def list_entity_links(
     limit: int = ENTITY_LINK_LIST_DEFAULT_LIMIT, offset: int = 0,
 ) -> list[TaskEntityLink]:
     slug = _assert_entity_link_board(conn, board_slug)
+    task_id = _validate_entity_task_id(task_id)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= ENTITY_LINK_LIST_MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {ENTITY_LINK_LIST_MAX_LIMIT}")
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -1713,6 +1726,7 @@ def get_entity_link(
     conn: sqlite3.Connection, *, board_slug: str, task_id: str, link_id: str,
 ) -> Optional[TaskEntityLink]:
     slug = _assert_entity_link_board(conn, board_slug)
+    task_id = _validate_entity_task_id(task_id)
     link_id = _validate_entity_link_id(link_id)
     row = conn.execute(
         "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? AND link_id=?",
@@ -1728,6 +1742,7 @@ def detach_entity_link(
 ) -> bool:
     """Remove only the local link. A receipt makes identical retries idempotent."""
     slug = _assert_entity_link_board(conn, board_slug)
+    task_id = _validate_entity_task_id(task_id)
     link_id = _validate_entity_link_id(link_id)
     actor = _validate_entity_safe_text(actor, "actor", max_length=128)
     key = _validate_entity_safe_text(idempotency_key, "idempotency_key", max_length=256)
@@ -1745,7 +1760,7 @@ def detach_entity_link(
                 raise EntityLinkIdempotencyConflict("idempotency_conflict")
             return True
         if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
-            raise ValueError(f"task not found: {task_id}")
+            raise ValueError("task not found")
         conn.execute(
             "DELETE FROM task_entity_links WHERE board_slug=? AND task_id=? AND link_id=?",
             (slug, task_id, link_id),
@@ -1773,6 +1788,7 @@ def _update_entity_link_verification(
 ) -> TaskEntityLink:
     """Storage-only verification interface; it never reads CRM or changes tasks."""
     slug = _assert_entity_link_board(conn, board_slug)
+    task_id = _validate_entity_task_id(task_id)
     link_id = _validate_entity_link_id(link_id)
     if verification_state not in VALID_ENTITY_VERIFICATION_STATES:
         raise ValueError(

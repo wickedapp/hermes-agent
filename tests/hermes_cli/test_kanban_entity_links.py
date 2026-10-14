@@ -104,6 +104,26 @@ def test_attach_replay_conflict_validation_and_cascade(boards):
         assert kb.list_entity_links(conn, board_slug="default", task_id=boards) == []
 
 
+@pytest.mark.parametrize("legacy_task_id", ["t_ab12", "t_legacy_1"])
+def test_entity_links_remain_available_to_safe_legacy_task_ids(
+    boards, legacy_task_id,
+):
+    with kb.connect(board="default") as conn:
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,created_at,workspace_kind) "
+            "VALUES (?,?,?,?,?)",
+            (legacy_task_id, "legacy", "todo", 1, "scratch"),
+        )
+        link = kb.attach_entity_link(
+            conn, board_slug="default", task_id=legacy_task_id,
+            entity_type="contact", external_id="7", relation_role="context",
+            created_by="tester", idempotency_key=f"legacy-{legacy_task_id}",
+        )
+        assert kb.list_entity_links(
+            conn, board_slug="default", task_id=legacy_task_id,
+        ) == [link]
+
+
 def test_list_entity_links_is_bounded_and_paginated(boards):
     with kb.connect(board="default") as conn:
         for index in range(105):
@@ -403,6 +423,76 @@ def test_attach_rejects_sensitive_metadata_fields(boards, field, value):
         assert kb.list_entity_links(
             conn, board_slug="default", task_id=boards,
         ) == []
+
+
+def test_entity_link_storage_rejects_noncanonical_task_ids_without_reflection(boards):
+    sensitive = "Authorization: Bearer secret-token"
+    link_id = "el_" + "0" * 32
+    with kb.connect(board="default") as conn:
+        calls = (
+            lambda: kb.attach_entity_link(
+                conn, board_slug="default", task_id=sensitive,
+                entity_type="contact", external_id="1", relation_role="context",
+                created_by="tester", idempotency_key="bad-task-attach",
+            ),
+            lambda: kb.list_entity_links(
+                conn, board_slug="default", task_id=sensitive,
+            ),
+            lambda: kb.get_entity_link(
+                conn, board_slug="default", task_id=sensitive, link_id=link_id,
+            ),
+            lambda: kb.detach_entity_link(
+                conn, board_slug="default", task_id=sensitive, link_id=link_id,
+                actor="tester", idempotency_key="bad-task-detach",
+            ),
+            lambda: kb.resolve_entity_link(
+                conn, board_slug="default", task_id=sensitive, link_id=link_id,
+            ),
+        )
+        for call in calls:
+            with pytest.raises(ValueError) as exc:
+                call()
+            assert str(exc.value) == "task_id must be an opaque Kanban task ID"
+            assert sensitive not in str(exc.value)
+
+
+def test_entity_link_public_surfaces_do_not_reflect_invalid_task_id(
+    boards, monkeypatch, capsys,
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from hermes_cli.kanban import kanban_command
+    from tools import kanban_tools as tools
+
+    sensitive = "Authorization: Bearer secret-token"
+    cli_result = kanban_command(argparse.Namespace(
+        kanban_action="entity-links", entity_links_action="list",
+        board="default", task_id=sensitive, json=True, limit=100, offset=0,
+    ))
+    assert cli_result == 1
+    cli_error = capsys.readouterr().err
+    assert "opaque Kanban task ID" in cli_error and sensitive not in cli_error
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", boards)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    tool_result = tools._handle_list_entity_links({
+        "board": "default", "task_id": sensitive,
+    })
+    assert "different task_id" in tool_result and sensitive not in tool_result
+    assert boards not in tool_result
+
+    plugin_file = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/plugin_api.py"
+    spec = importlib.util.spec_from_file_location("invalid_task_dashboard_test", plugin_file)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    app = FastAPI()
+    app.include_router(module.router, prefix="/api/plugins/kanban")
+    response = TestClient(app).get(
+        f"/api/plugins/kanban/tasks/{sensitive}/entity-links?board=default"
+    )
+    assert response.status_code == 400
+    assert "opaque Kanban task ID" in response.text and sensitive not in response.text
 
 
 def test_resolver_rejects_sensitive_version_and_invalid_link_id(boards):
