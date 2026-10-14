@@ -231,7 +231,9 @@ def _entity_link_scope(args: dict) -> tuple[Optional[str], Optional[str], Option
     if ownership_error:
         return None, None, ownership_error
     pinned = os.environ.get("HERMES_KANBAN_BOARD")
-    if os.environ.get("HERMES_KANBAN_TASK") and pinned and board != pinned:
+    if not pinned:
+        return None, None, "entity-link tools require HERMES_KANBAN_BOARD"
+    if board != pinned:
         return None, None, tool_error(
             f"worker is pinned to board {pinned}; refusing board {board}"
         )
@@ -264,7 +266,7 @@ def _handle_entity_link(args: dict, operation: str) -> str:
                     entity_type=args.get("entity_type"),
                     external_id=args.get("external_id"),
                     relation_role=args.get("relation_role"),
-                    created_by=args.get("actor") or os.environ.get("HERMES_PROFILE") or "agent",
+                    created_by=os.environ.get("HERMES_PROFILE") or "agent",
                     idempotency_key=args.get("idempotency_key"),
                 )
                 return _ok(link=_entity_link_dict(link))
@@ -272,7 +274,7 @@ def _handle_entity_link(args: dict, operation: str) -> str:
                 detached = kb.detach_entity_link(
                     conn, board_slug=board, task_id=task_id,
                     link_id=args.get("link_id"),
-                    actor=args.get("actor") or os.environ.get("HERMES_PROFILE") or "agent",
+                    actor=os.environ.get("HERMES_PROFILE") or "agent",
                     idempotency_key=args.get("idempotency_key"),
                 )
                 return _ok(detached=detached, link_id=args.get("link_id"))
@@ -1326,7 +1328,7 @@ KANBAN_ATTACH_ENTITY_LINK_SCHEMA = {
         "entity_type": {"type": "string", "enum": ["customer", "contact", "lead", "proposal", "estimate", "invoice", "payment", "ticket"]},
         "external_id": {"type": "string", "pattern": "^[0-9]+$"},
         "relation_role": {"type": "string", "enum": ["primary", "context", "result"]},
-        "idempotency_key": {"type": "string"}, "actor": {"type": "string"},
+        "idempotency_key": {"type": "string"},
     }, "required": ["board", "task_id", "entity_type", "external_id", "relation_role", "idempotency_key"]},
 }
 KANBAN_DETACH_ENTITY_LINK_SCHEMA = {
@@ -1334,7 +1336,7 @@ KANBAN_DETACH_ENTITY_LINK_SCHEMA = {
     "description": "Detach only the local entity reference from one task.",
     "parameters": {"type": "object", "properties": {
         **_ENTITY_BASE_PROPERTIES, "link_id": {"type": "string"},
-        "idempotency_key": {"type": "string"}, "actor": {"type": "string"},
+        "idempotency_key": {"type": "string"},
     }, "required": ["board", "task_id", "link_id", "idempotency_key"]},
 }
 KANBAN_LIST_ENTITY_LINKS_SCHEMA = {

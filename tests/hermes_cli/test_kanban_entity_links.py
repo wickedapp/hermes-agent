@@ -304,6 +304,70 @@ def test_snapshot_string_length_boundary_accepts_31_and_rejects_32(boards):
         assert len(kb.list_events(conn, boards)) == before_events
 
 
+@pytest.mark.parametrize("amount", [float("nan"), float("inf"), float("-inf")])
+def test_snapshot_rejects_non_finite_amounts(boards, amount):
+    with kb.connect(board="default") as conn:
+        link = kb.attach_entity_link(
+            conn, board_slug="default", task_id=boards, entity_type="invoice",
+            external_id="921", relation_role="result", created_by="tester",
+            idempotency_key=f"non-finite-{amount!r}",
+        )
+        with pytest.raises(kb.EntityLinkResolutionError) as exc:
+            kb.resolve_entity_link(
+                conn, board_slug="default", task_id=boards, link_id=link.link_id,
+                resolver=lambda _link, _refresh: {
+                    "verification_state": "verified",
+                    "display_snapshot": {"amount": amount},
+                },
+            )
+        assert exc.value.code == "remote_contract_mismatch"
+
+
+def test_registered_resolver_dispatches_and_sanitizes_raised_message(boards):
+    with kb.connect(board="default") as conn:
+        link = kb.attach_entity_link(
+            conn, board_slug="default", task_id=boards, entity_type="lead",
+            external_id="922", relation_role="context", created_by="tester",
+            idempotency_key="registered-resolver",
+        )
+        kb.register_entity_link_resolver(
+            kb.ENTITY_LINK_PROVIDER,
+            lambda _link, refresh: {
+                "verification_state": "verified",
+                "last_seen_version": "v2" if refresh else "v1",
+            },
+        )
+        assert kb.resolve_entity_link(
+            conn, board_slug="default", task_id=boards,
+            link_id=link.link_id, refresh=True,
+        ).last_seen_version == "v2"
+        kb.register_entity_link_resolver(
+            kb.ENTITY_LINK_PROVIDER,
+            lambda _link, _refresh: (_ for _ in ()).throw(
+                kb.EntityLinkResolutionError("permission_denied", "Bearer secret")
+            ),
+        )
+        with pytest.raises(kb.EntityLinkResolutionError) as exc:
+            kb.resolve_entity_link(
+                conn, board_slug="default", task_id=boards, link_id=link.link_id,
+            )
+        assert str(exc.value) == "permission_denied"
+    kb._ENTITY_LINK_RESOLVERS.pop(kb.ENTITY_LINK_PROVIDER, None)
+
+
+def test_storage_rejects_override_without_pin_and_cross_board_pin(boards, monkeypatch):
+    db_path = kb.kanban_db_path(board="default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    with kb.connect(board="default") as conn:
+        with pytest.raises(ValueError, match="requires a pinned board"):
+            kb.list_entity_links(conn, board_slug="default", task_id=boards)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    with kb.connect(board="default") as conn:
+        with pytest.raises(ValueError, match="pinned to board"):
+            kb.list_entity_links(conn, board_slug="other", task_id=boards)
+
+
 @pytest.mark.parametrize("field,value", [
     ("actor", "Authorization: Bearer abc.def"),
     ("actor", "person@example.com"),
@@ -426,6 +490,26 @@ def test_structured_tools_preserve_worker_pin_for_entity_link_routes(boards, mon
     assert unavailable["code"] == "capability_unavailable"
 
 
+def test_structured_tools_require_pin_and_ignore_caller_actor(boards, monkeypatch):
+    from tools import kanban_tools as tools
+
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    refused = json.loads(tools._handle_list_entity_links({
+        "board": "default", "task_id": boards,
+    }))
+    assert "require HERMES_KANBAN_BOARD" in refused["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_PROFILE", "trusted-profile")
+    attached = json.loads(tools._handle_attach_entity_link({
+        "board": "default", "task_id": boards, "entity_type": "contact",
+        "external_id": "889", "relation_role": "context",
+        "idempotency_key": "trusted-actor", "actor": "forged-caller",
+    }))
+    assert attached["ok"] is True
+    assert attached["link"]["created_by"] == "trusted-profile"
+
+
 def test_dashboard_entity_link_routes_are_board_isolated(boards):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -451,6 +535,9 @@ def test_dashboard_entity_link_routes_are_board_isolated(boards):
     assert client.get(
         f"/api/plugins/kanban/tasks/{boards}/entity-links/{link_id}?board=other"
     ).status_code == 404
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links/not-an-id?board=default"
+    ).status_code == 400
     detached = client.post(
         f"/api/plugins/kanban/tasks/{boards}/entity-links/{link_id}/detach?board=other",
         json={"idempotency_key": "api-detach-other"},
@@ -465,3 +552,9 @@ def test_dashboard_entity_link_routes_are_board_isolated(boards):
     )
     assert unavailable.status_code == 501
     assert unavailable.json()["detail"]["code"] == "capability_unavailable"
+    missing = client.post(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links/el_{'0' * 32}/resolve?board=default",
+        json={"refresh": False},
+    )
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "not_found"

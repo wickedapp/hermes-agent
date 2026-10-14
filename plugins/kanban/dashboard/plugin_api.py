@@ -607,6 +607,8 @@ def get_entity_link(task_id: str, link_id: str, board: str = Query(...)):
         if link is None:
             raise HTTPException(status_code=404, detail="entity link not found")
         return {"link": asdict(link)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     finally:
         conn.close()
 
@@ -666,7 +668,11 @@ def resolve_entity_link(
         )
         return {"link": asdict(link)}
     except kanban_db.EntityLinkResolutionError as exc:
-        http_code = 501 if exc.code == "capability_unavailable" else 502
+        http_code = {
+            "capability_unavailable": 501,
+            "not_found": 404,
+            "invalid_reference": 400,
+        }.get(exc.code, 502)
         raise HTTPException(status_code=http_code, detail={"code": exc.code})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

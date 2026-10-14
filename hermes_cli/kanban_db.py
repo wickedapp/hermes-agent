@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import secrets
@@ -889,7 +890,9 @@ class EntityLinkResolutionError(RuntimeError):
         if code not in VALID_ENTITY_RESOLUTION_ERRORS:
             code = "remote_contract_mismatch"
         self.code = code
-        super().__init__(message or code)
+        # Adapter messages may contain credentials, response bodies, or PII.
+        # Only the closed error code may cross this trust boundary.
+        super().__init__(code)
 
 
 _ENTITY_LINK_RESOLVERS: dict[str, Callable[[TaskEntityLink, bool], dict[str, Any]]] = {}
@@ -1508,10 +1511,16 @@ def _assert_entity_link_board(conn: sqlite3.Connection, board_slug: str) -> str:
     slug = _normalize_board_slug(board_slug)
     if not slug:
         raise ValueError("board_slug is required")
+    pinned = _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override and not pinned:
+        raise ValueError("HERMES_KANBAN_DB entity-link access requires a pinned board")
+    if pinned and slug != pinned:
+        raise ValueError(f"connection is pinned to board {pinned!r}")
     db_file = conn.execute("PRAGMA database_list").fetchone()[2]
     if db_file:
         actual = Path(db_file).resolve()
-        expected = kanban_db_path(board=slug).resolve()
+        expected = (Path(override).expanduser() if override else kanban_db_path(board=slug)).resolve()
         if actual != expected:
             raise ValueError(f"connection is not scoped to board {slug!r}")
     return slug
@@ -1580,6 +1589,8 @@ def _validate_entity_snapshot(snapshot: Optional[dict[str, Any]]) -> Optional[st
             raise ValueError(f"display_snapshot.{key} must be display text or null")
         if key == "amount" and value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
             raise ValueError("display_snapshot.amount must be numeric or null")
+        if key == "amount" and isinstance(value, (int, float)) and not math.isfinite(value):
+            raise ValueError("display_snapshot.amount must be finite")
         if isinstance(value, str) and len(value) >= 32:
             raise ValueError(f"display_snapshot.{key} exceeds 31 characters")
         if isinstance(value, str):
@@ -1815,7 +1826,7 @@ def resolve_entity_link(
         conn, board_slug=board_slug, task_id=task_id, link_id=link_id,
     )
     if link is None:
-        raise EntityLinkResolutionError("invalid_reference")
+        raise EntityLinkResolutionError("not_found")
     adapter = resolver or _ENTITY_LINK_RESOLVERS.get(link.provider)
     if adapter is None:
         raise EntityLinkResolutionError("capability_unavailable")
