@@ -14,7 +14,7 @@ from hermes_cli import kanban_db as kb
 
 
 def test_entity_link_migration_preserves_every_task_and_integrity(tmp_path):
-    """Prove the legacy schema is RED, then migrate it through normal discovery."""
+    """Exercise the pre-feature schema, then migrate it through normal discovery."""
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys=ON")
