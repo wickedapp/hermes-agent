@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
@@ -154,9 +155,9 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
         return None
     if tid != env_tid:
         return tool_error(
-            f"worker is scoped to task {env_tid}; refusing to mutate "
-            f"{tid}. Use kanban_comment to hand off information to other "
-            f"tasks, or kanban_create to spawn follow-up work."
+            "worker is scoped to its assigned task; refusing to mutate a "
+            "different task_id. Use kanban_comment to hand off information "
+            "to other tasks, or kanban_create to spawn follow-up work."
         )
     return None
 
@@ -220,6 +221,122 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             "kanban_comment for their assigned task."
         )
     return None
+
+
+def _entity_link_scope(args: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    task_id = _default_task_id(args.get("task_id"))
+    board = args.get("board")
+    if not task_id or not board:
+        return None, None, "task_id and explicit board are required"
+    # Validate caller-controlled scope before comparing it with the trusted
+    # worker pin.  Keep failures closed and non-reflective: tool errors can be
+    # surfaced in model transcripts and must never echo arbitrary input.
+    if not isinstance(board, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9_-]{0,63}", board
+    ):
+        return None, None, "board must be a canonical Kanban board slug"
+    ownership_error = _enforce_worker_task_ownership(task_id)
+    if ownership_error:
+        return None, None, ownership_error
+    pinned = os.environ.get("HERMES_KANBAN_BOARD")
+    if not pinned:
+        return None, None, "entity-link tools require HERMES_KANBAN_BOARD"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", pinned):
+        return None, None, "entity-link worker board pin is invalid"
+    if board != pinned:
+        return None, None, "entity-link board scope mismatch"
+    return task_id, board, None
+
+
+def _entity_link_dict(link) -> dict[str, Any]:
+    return {
+        "link_id": link.link_id, "board_slug": link.board_slug,
+        "task_id": link.task_id, "provider": link.provider,
+        "entity_type": link.entity_type, "external_id": link.external_id,
+        "relation_role": link.relation_role, "created_by": link.created_by,
+        "created_at": link.created_at, "verified_at": link.verified_at,
+        "verification_state": link.verification_state,
+        "last_seen_version": link.last_seen_version,
+        "display_snapshot": link.display_snapshot,
+    }
+
+
+def _handle_entity_link(args: dict, operation: str) -> str:
+    task_id, board, scope_error = _entity_link_scope(args)
+    if scope_error:
+        return scope_error if scope_error.startswith("{") else tool_error(scope_error)
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if operation == "attach":
+                link = kb.attach_entity_link(
+                    conn, board_slug=board, task_id=task_id,
+                    entity_type=args.get("entity_type"),
+                    external_id=args.get("external_id"),
+                    relation_role=args.get("relation_role"),
+                    created_by=os.environ.get("HERMES_PROFILE") or "agent",
+                    idempotency_key=args.get("idempotency_key"),
+                )
+                return _ok(link=_entity_link_dict(link))
+            if operation == "detach":
+                detached = kb.detach_entity_link(
+                    conn, board_slug=board, task_id=task_id,
+                    link_id=args.get("link_id"),
+                    actor=os.environ.get("HERMES_PROFILE") or "agent",
+                    idempotency_key=args.get("idempotency_key"),
+                )
+                return _ok(detached=detached, link_id=args.get("link_id"))
+            if operation == "list":
+                links = kb.list_entity_links(
+                    conn, board_slug=board, task_id=task_id,
+                    limit=args.get("limit", kb.ENTITY_LINK_LIST_DEFAULT_LIMIT),
+                    offset=args.get("offset", 0),
+                )
+                return _ok(links=[_entity_link_dict(link) for link in links])
+            if operation == "resolve":
+                link = kb.resolve_entity_link(
+                    conn, board_slug=board, task_id=task_id,
+                    link_id=args.get("link_id"), refresh=bool(args.get("refresh", False)),
+                )
+                return _ok(link=_entity_link_dict(link))
+            link = kb.get_entity_link(
+                conn, board_slug=board, task_id=task_id, link_id=args.get("link_id"),
+            )
+            if link is None:
+                return tool_error(f"entity link {args.get('link_id')} not found")
+            return _ok(link=_entity_link_dict(link))
+        finally:
+            conn.close()
+    except Exception as exc:
+        try:
+            from hermes_cli.kanban_db import EntityLinkResolutionError
+            if isinstance(exc, EntityLinkResolutionError):
+                return tool_error(
+                    f"kanban_{operation}_entity_link: {exc.code}", code=exc.code,
+                )
+        except ImportError:
+            pass
+        return tool_error(f"kanban_{operation}_entity_link: {exc}")
+
+
+def _handle_attach_entity_link(args: dict, **kw) -> str:
+    return _handle_entity_link(args, "attach")
+
+
+def _handle_detach_entity_link(args: dict, **kw) -> str:
+    return _handle_entity_link(args, "detach")
+
+
+def _handle_list_entity_links(args: dict, **kw) -> str:
+    return _handle_entity_link(args, "list")
+
+
+def _handle_get_entity_link(args: dict, **kw) -> str:
+    return _handle_entity_link(args, "get")
+
+
+def _handle_resolve_entity_link(args: dict, **kw) -> str:
+    return _handle_entity_link(args, "resolve")
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
@@ -1210,6 +1327,56 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+_ENTITY_BASE_PROPERTIES = {
+    "board": {"type": "string", "description": "Explicit board slug."},
+    "task_id": {"type": "string", "description": "Task id on that board."},
+}
+
+KANBAN_ATTACH_ENTITY_LINK_SCHEMA = {
+    "name": "kanban_attach_entity_link",
+    "description": "Attach a local KCC CRM entity reference to one task.",
+    "parameters": {"type": "object", "properties": {
+        **_ENTITY_BASE_PROPERTIES,
+        "entity_type": {"type": "string", "enum": ["customer", "contact", "lead", "proposal", "estimate", "invoice", "payment", "ticket"]},
+        "external_id": {"type": "string", "pattern": "^[0-9]+$", "maxLength": 64},
+        "relation_role": {"type": "string", "enum": ["primary", "context", "result"]},
+        "idempotency_key": {"type": "string"},
+    }, "required": ["board", "task_id", "entity_type", "external_id", "relation_role", "idempotency_key"]},
+}
+KANBAN_DETACH_ENTITY_LINK_SCHEMA = {
+    "name": "kanban_detach_entity_link",
+    "description": "Detach only the local entity reference from one task.",
+    "parameters": {"type": "object", "properties": {
+        **_ENTITY_BASE_PROPERTIES, "link_id": {"type": "string"},
+        "idempotency_key": {"type": "string"},
+    }, "required": ["board", "task_id", "link_id", "idempotency_key"]},
+}
+KANBAN_LIST_ENTITY_LINKS_SCHEMA = {
+    "name": "kanban_list_entity_links",
+    "description": "List local entity references for one explicit board and task.",
+    "parameters": {"type": "object", "properties": {
+        **_ENTITY_BASE_PROPERTIES,
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+        "offset": {"type": "integer", "minimum": 0, "default": 0},
+    },
+                   "required": ["board", "task_id"]},
+}
+KANBAN_GET_ENTITY_LINK_SCHEMA = {
+    "name": "kanban_get_entity_link",
+    "description": "Get one local entity reference by opaque link id.",
+    "parameters": {"type": "object", "properties": {
+        **_ENTITY_BASE_PROPERTIES, "link_id": {"type": "string"},
+    }, "required": ["board", "task_id", "link_id"]},
+}
+KANBAN_RESOLVE_ENTITY_LINK_SCHEMA = {
+    "name": "kanban_resolve_entity_link",
+    "description": "Resolve one entity reference through a registered read adapter.",
+    "parameters": {"type": "object", "properties": {
+        **_ENTITY_BASE_PROPERTIES, "link_id": {"type": "string"},
+        "refresh": {"type": "boolean"},
+    }, "required": ["board", "task_id", "link_id"]},
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -1295,3 +1462,15 @@ registry.register(
     check_fn=_check_kanban_mode,
     emoji="🔗",
 )
+
+for _name, _schema, _handler in (
+    ("kanban_attach_entity_link", KANBAN_ATTACH_ENTITY_LINK_SCHEMA, _handle_attach_entity_link),
+    ("kanban_detach_entity_link", KANBAN_DETACH_ENTITY_LINK_SCHEMA, _handle_detach_entity_link),
+    ("kanban_list_entity_links", KANBAN_LIST_ENTITY_LINKS_SCHEMA, _handle_list_entity_links),
+    ("kanban_get_entity_link", KANBAN_GET_ENTITY_LINK_SCHEMA, _handle_get_entity_link),
+    ("kanban_resolve_entity_link", KANBAN_RESOLVE_ENTITY_LINK_SCHEMA, _handle_resolve_entity_link),
+):
+    registry.register(
+        name=_name, toolset="kanban", schema=_schema, handler=_handler,
+        check_fn=_check_kanban_mode, emoji="🔗",
+    )

@@ -57,6 +57,9 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_attach_entity_link", "kanban_detach_entity_link",
+        "kanban_list_entity_links", "kanban_get_entity_link",
+        "kanban_resolve_entity_link",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -138,6 +141,9 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
+        "kanban_attach_entity_link", "kanban_detach_entity_link",
+        "kanban_list_entity_links", "kanban_get_entity_link",
+        "kanban_resolve_entity_link",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 

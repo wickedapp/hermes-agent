@@ -67,6 +67,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
+    "kanban_attach_entity_link", "kanban_detach_entity_link",
+    "kanban_list_entity_links", "kanban_get_entity_link",
+    "kanban_resolve_entity_link",
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
@@ -252,7 +255,10 @@ TOOLSETS = {
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
             "kanban_heartbeat", "kanban_comment",
-            "kanban_create", "kanban_link",
+            "kanban_create", "kanban_link", "kanban_attach_entity_link",
+            "kanban_detach_entity_link", "kanban_list_entity_links",
+            "kanban_get_entity_link",
+            "kanban_resolve_entity_link",
             "kanban_unblock",
         ],
         "includes": [],

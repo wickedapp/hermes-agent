@@ -46,7 +46,7 @@ from dataclasses import asdict
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -95,12 +95,12 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
         return None
     try:
         normed = kanban_db._normalize_board_slug(board)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid board slug")
     if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
         raise HTTPException(
             status_code=404,
-            detail=f"board {normed!r} does not exist",
+            detail="board does not exist",
         )
     return normed
 
@@ -563,6 +563,132 @@ class CreateTaskBody(BaseModel):
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
+
+
+class AttachEntityLinkBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entity_type: str
+    external_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9]+$")
+    relation_role: str
+    idempotency_key: str
+
+
+class DetachEntityLinkBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str
+
+
+class ResolveEntityLinkBody(BaseModel):
+    refresh: bool = False
+
+
+@router.get("/tasks/{task_id}/entity-links")
+def list_entity_links(
+    task_id: str, board: str = Query(...),
+    limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"links": [asdict(link) for link in kanban_db.list_entity_links(
+            conn, board_slug=board, task_id=task_id,
+            limit=limit, offset=offset,
+        )]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.get("/tasks/{task_id}/entity-links/{link_id}")
+def get_entity_link(task_id: str, link_id: str, board: str = Query(...)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        link = kanban_db.get_entity_link(
+            conn, board_slug=board, task_id=task_id, link_id=link_id,
+        )
+        if link is None:
+            raise HTTPException(status_code=404, detail="entity link not found")
+        return {"link": asdict(link)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/entity-links")
+def attach_entity_link(task_id: str, payload: AttachEntityLinkBody, board: str = Query(...)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        link = kanban_db.attach_entity_link(
+            conn, board_slug=board, task_id=task_id,
+            entity_type=payload.entity_type, external_id=payload.external_id,
+            relation_role=payload.relation_role, created_by="dashboard",
+            idempotency_key=payload.idempotency_key,
+        )
+        return {"link": asdict(link)}
+    except kanban_db.EntityLinkIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/entity-links/{link_id}/detach")
+def detach_entity_link(
+    task_id: str, link_id: str, payload: DetachEntityLinkBody,
+    board: str = Query(...),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {"detached": kanban_db.detach_entity_link(
+            conn, board_slug=board, task_id=task_id, link_id=link_id,
+            actor="dashboard", idempotency_key=payload.idempotency_key,
+        ), "link_id": link_id}
+    except kanban_db.EntityLinkIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/entity-links/{link_id}/resolve")
+def resolve_entity_link(
+    task_id: str, link_id: str, payload: ResolveEntityLinkBody,
+    board: str = Query(...),
+):
+    """Resolve through a registered read adapter; core ships no live adapter."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        link = kanban_db.resolve_entity_link(
+            conn, board_slug=board, task_id=task_id, link_id=link_id,
+            refresh=payload.refresh,
+        )
+        return {"link": asdict(link)}
+    except kanban_db.EntityLinkResolutionError as exc:
+        http_code = {
+            "capability_unavailable": 501,
+            "not_found": 404,
+            "invalid_reference": 400,
+            "permission_denied": 403,
+            "authentication_failed": 401,
+            "rate_limited": 429,
+            "transient_remote_error": 503,
+            "remote_contract_mismatch": 502,
+        }.get(exc.code, 502)
+        raise HTTPException(status_code=http_code, detail={"code": exc.code})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
 
 
 @router.post("/tasks")
