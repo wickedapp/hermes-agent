@@ -108,6 +108,9 @@ VALID_ENTITY_VERIFICATION_STATES = frozenset({
     "unverified", "verified", "missing", "forbidden", "unavailable",
 })
 _ENTITY_EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
+ENTITY_EXTERNAL_ID_MAX_LENGTH = 64
+ENTITY_LINK_LIST_DEFAULT_LIMIT = 100
+ENTITY_LINK_LIST_MAX_LIMIT = 100
 _ENTITY_LINK_ID_RE = re.compile(r"^el_[0-9a-f]{32}$")
 _ENTITY_SNAPSHOT_KEYS = frozenset({
     "label", "reference", "status", "priority", "amount", "currency",
@@ -1045,7 +1048,7 @@ CREATE TABLE IF NOT EXISTS task_entity_links (
     task_id              TEXT NOT NULL,
     provider             TEXT NOT NULL CHECK (provider = 'kcc_crm'),
     entity_type          TEXT NOT NULL CHECK (entity_type IN ('customer','contact','lead','proposal','estimate','invoice','payment','ticket')),
-    external_id          TEXT NOT NULL CHECK (external_id GLOB '[0-9]*' AND external_id NOT GLOB '*[^0-9]*' AND CAST(external_id AS INTEGER) > 0),
+    external_id          TEXT NOT NULL CHECK (length(external_id) BETWEEN 1 AND 64 AND external_id GLOB '[0-9]*' AND external_id NOT GLOB '*[^0-9]*' AND CAST(external_id AS INTEGER) > 0),
     relation_role        TEXT NOT NULL CHECK (relation_role IN ('primary','context','result')),
     created_by           TEXT NOT NULL,
     created_at           INTEGER NOT NULL,
@@ -1533,6 +1536,10 @@ def _validate_entity_link_fields(
         raise ValueError(f"entity_type must be one of {sorted(VALID_ENTITY_TYPES)}")
     if not isinstance(external_id, str) or not _ENTITY_EXTERNAL_ID_RE.fullmatch(external_id):
         raise ValueError("external_id must be an exact positive decimal text token")
+    if len(external_id) > ENTITY_EXTERNAL_ID_MAX_LENGTH:
+        raise ValueError(
+            f"external_id must be at most {ENTITY_EXTERNAL_ID_MAX_LENGTH} digits"
+        )
     if not any(ch != "0" for ch in external_id):
         raise ValueError("external_id must be greater than zero")
     if relation_role not in VALID_ENTITY_RELATION_ROLES:
@@ -1688,11 +1695,16 @@ def attach_entity_link(
 
 def list_entity_links(
     conn: sqlite3.Connection, *, board_slug: str, task_id: str,
+    limit: int = ENTITY_LINK_LIST_DEFAULT_LIMIT, offset: int = 0,
 ) -> list[TaskEntityLink]:
     slug = _assert_entity_link_board(conn, board_slug)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= ENTITY_LINK_LIST_MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {ENTITY_LINK_LIST_MAX_LIMIT}")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
     rows = conn.execute(
         "SELECT * FROM task_entity_links WHERE board_slug=? AND task_id=? "
-        "ORDER BY created_at, link_id", (slug, task_id),
+        "ORDER BY created_at, link_id LIMIT ? OFFSET ?", (slug, task_id, limit, offset),
     ).fetchall()
     return [TaskEntityLink.from_row(row) for row in rows]
 

@@ -567,7 +567,7 @@ class CreateTaskBody(BaseModel):
 
 class AttachEntityLinkBody(BaseModel):
     entity_type: str
-    external_id: str
+    external_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9]+$")
     relation_role: str
     idempotency_key: str
     actor: str = "dashboard"
@@ -583,12 +583,16 @@ class ResolveEntityLinkBody(BaseModel):
 
 
 @router.get("/tasks/{task_id}/entity-links")
-def list_entity_links(task_id: str, board: str = Query(...)):
+def list_entity_links(
+    task_id: str, board: str = Query(...),
+    limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
         return {"links": [asdict(link) for link in kanban_db.list_entity_links(
             conn, board_slug=board, task_id=task_id,
+            limit=limit, offset=offset,
         )]}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

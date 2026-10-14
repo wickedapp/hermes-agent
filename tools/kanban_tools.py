@@ -279,7 +279,11 @@ def _handle_entity_link(args: dict, operation: str) -> str:
                 )
                 return _ok(detached=detached, link_id=args.get("link_id"))
             if operation == "list":
-                links = kb.list_entity_links(conn, board_slug=board, task_id=task_id)
+                links = kb.list_entity_links(
+                    conn, board_slug=board, task_id=task_id,
+                    limit=args.get("limit", kb.ENTITY_LINK_LIST_DEFAULT_LIMIT),
+                    offset=args.get("offset", 0),
+                )
                 return _ok(links=[_entity_link_dict(link) for link in links])
             if operation == "resolve":
                 link = kb.resolve_entity_link(
@@ -1326,7 +1330,7 @@ KANBAN_ATTACH_ENTITY_LINK_SCHEMA = {
     "parameters": {"type": "object", "properties": {
         **_ENTITY_BASE_PROPERTIES,
         "entity_type": {"type": "string", "enum": ["customer", "contact", "lead", "proposal", "estimate", "invoice", "payment", "ticket"]},
-        "external_id": {"type": "string", "pattern": "^[0-9]+$"},
+        "external_id": {"type": "string", "pattern": "^[0-9]+$", "maxLength": 64},
         "relation_role": {"type": "string", "enum": ["primary", "context", "result"]},
         "idempotency_key": {"type": "string"},
     }, "required": ["board", "task_id", "entity_type", "external_id", "relation_role", "idempotency_key"]},
@@ -1342,7 +1346,11 @@ KANBAN_DETACH_ENTITY_LINK_SCHEMA = {
 KANBAN_LIST_ENTITY_LINKS_SCHEMA = {
     "name": "kanban_list_entity_links",
     "description": "List local entity references for one explicit board and task.",
-    "parameters": {"type": "object", "properties": _ENTITY_BASE_PROPERTIES,
+    "parameters": {"type": "object", "properties": {
+        **_ENTITY_BASE_PROPERTIES,
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+        "offset": {"type": "integer", "minimum": 0, "default": 0},
+    },
                    "required": ["board", "task_id"]},
 }
 KANBAN_GET_ENTITY_LINK_SCHEMA = {

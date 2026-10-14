@@ -243,6 +243,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     e_detach.add_argument("--json", action="store_true")
     e_list = entity_sub.add_parser("list")
     e_list.add_argument("task_id")
+    e_list.add_argument("--limit", type=int, default=kb.ENTITY_LINK_LIST_DEFAULT_LIMIT)
+    e_list.add_argument("--offset", type=int, default=0)
     e_list.add_argument("--json", action="store_true")
     e_get = entity_sub.add_parser("get")
     e_get.add_argument("task_id")
@@ -1019,6 +1021,8 @@ def _cmd_entity_links(args: argparse.Namespace) -> int:
         elif action == "list":
             data = [_entity_link_dict(link) for link in kb.list_entity_links(
                 conn, board_slug=board, task_id=args.task_id,
+                limit=getattr(args, "limit", kb.ENTITY_LINK_LIST_DEFAULT_LIMIT),
+                offset=getattr(args, "offset", 0),
             )]
         elif action == "get":
             link = kb.get_entity_link(

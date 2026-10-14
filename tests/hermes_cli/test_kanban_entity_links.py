@@ -4,12 +4,49 @@ import threading
 import argparse
 import importlib.util
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def test_entity_link_migration_preserves_every_task_and_integrity(tmp_path):
+    """Exercise the checked-in pre-feature schema through normal discovery."""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=ON")
+    schema_fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "kanban"
+        / "pre_entity_links_schema.sql"
+    )
+    conn.executescript(schema_fixture.read_text(encoding="utf-8"))
+    legacy_tasks = [
+        ("t_legacy_1", "legacy one", "todo", 1, "scratch"),
+        ("t_legacy_2", "legacy two", "done", 2, "scratch"),
+    ]
+    conn.executemany(
+        "INSERT INTO tasks (id,title,status,created_at,workspace_kind) VALUES (?,?,?,?,?)",
+        legacy_tasks,
+    )
+    conn.commit()
+    conn.close()
+
+    kb.init_db(db_path)
+    kb.init_db(db_path)
+    with kb.connect(db_path) as migrated:
+        assert [tuple(row) for row in migrated.execute(
+            "SELECT id,title,status,created_at,workspace_kind FROM tasks ORDER BY id"
+        )] == legacy_tasks
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migrated.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_entity_links'"
+        ).fetchone()
 
 
 @pytest.fixture
@@ -57,8 +94,44 @@ def test_attach_replay_conflict_validation_and_cascade(boards):
                     external_id=bad, relation_role="context", created_by="tester",
                     idempotency_key=f"bad-{bad}",
                 )
+        with pytest.raises(ValueError, match="at most"):
+            kb.attach_entity_link(
+                conn, board_slug="default", task_id=boards, entity_type="contact",
+                external_id="1" * 65, relation_role="context", created_by="tester",
+                idempotency_key="oversized-external-id",
+            )
         conn.execute("DELETE FROM tasks WHERE id=?", (boards,))
         assert kb.list_entity_links(conn, board_slug="default", task_id=boards) == []
+
+
+def test_list_entity_links_is_bounded_and_paginated(boards):
+    with kb.connect(board="default") as conn:
+        for index in range(105):
+            kb.attach_entity_link(
+                conn, board_slug="default", task_id=boards,
+                entity_type="contact", external_id=str(index + 1),
+                relation_role="context", created_by="tester",
+                idempotency_key=f"page-{index}",
+            )
+        first = kb.list_entity_links(
+            conn, board_slug="default", task_id=boards, limit=100, offset=0,
+        )
+        second = kb.list_entity_links(
+            conn, board_slug="default", task_id=boards, limit=100, offset=100,
+        )
+        assert len(first) == 100
+        assert len(second) == 5
+        assert {link.link_id for link in first}.isdisjoint(
+            link.link_id for link in second
+        )
+        with pytest.raises(ValueError, match="limit"):
+            kb.list_entity_links(
+                conn, board_slug="default", task_id=boards, limit=101,
+            )
+        with pytest.raises(ValueError, match="offset"):
+            kb.list_entity_links(
+                conn, board_slug="default", task_id=boards, offset=-1,
+            )
 
 
 def test_concurrent_equivalent_attach_has_one_canonical_row(boards):
@@ -451,6 +524,18 @@ def test_structured_tools_require_pin_and_ignore_caller_actor(boards, monkeypatc
     }))
     assert attached["ok"] is True
     assert attached["link"]["created_by"] == "trusted-profile"
+    second = json.loads(tools._handle_attach_entity_link({
+        "board": "default", "task_id": boards, "entity_type": "contact",
+        "external_id": "890", "relation_role": "context",
+        "idempotency_key": "trusted-actor-2",
+    }))
+    page = json.loads(tools._handle_list_entity_links({
+        "board": "default", "task_id": boards, "limit": 1, "offset": 1,
+    }))
+    assert page["ok"] is True and len(page["links"]) == 1
+    assert page["links"][0]["link_id"] in {
+        attached["link"]["link_id"], second["link"]["link_id"],
+    }
 
 
 def test_dashboard_entity_link_routes_are_board_isolated(boards):
@@ -473,6 +558,29 @@ def test_dashboard_entity_link_routes_are_board_isolated(boards):
     )
     assert attached.status_code == 200
     link_id = attached.json()["link"]["link_id"]
+    second = client.post(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links?board=default",
+        json={"entity_type": "invoice", "external_id": "102",
+              "relation_role": "result", "idempotency_key": "api-attach-2"},
+    )
+    assert second.status_code == 200
+    page = client.get(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links"
+        "?board=default&limit=1&offset=1"
+    )
+    assert page.status_code == 200 and len(page.json()["links"]) == 1
+    assert page.json()["links"][0]["link_id"] in {
+        link_id, second.json()["link"]["link_id"],
+    }
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links?board=default&limit=101"
+    ).status_code == 422
+    oversized = client.post(
+        f"/api/plugins/kanban/tasks/{boards}/entity-links?board=default",
+        json={"entity_type": "invoice", "external_id": "1" * 65,
+              "relation_role": "result", "idempotency_key": "api-oversized"},
+    )
+    assert oversized.status_code == 422
     listed = client.get(f"/api/plugins/kanban/tasks/{boards}/entity-links?board=other")
     assert listed.status_code == 200 and listed.json()["links"] == []
     assert client.get(
