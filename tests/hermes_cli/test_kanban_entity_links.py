@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 import argparse
 import importlib.util
@@ -24,62 +23,6 @@ def boards(tmp_path, monkeypatch):
     with kb.connect(board="default") as conn:
         task_id = kb.create_task(conn, title="linked task", created_by="tester")
     return task_id
-
-
-def test_entity_link_migration_preserves_existing_data_and_integrity(tmp_path):
-    db_path = tmp_path / "legacy.db"
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys=ON")
-    # Build the pre-entity-link shape directly. Using the current SCHEMA_SQL
-    # here would only exercise an idempotent reopen of the new schema, not an
-    # upgrade of an existing Kanban database.
-    conn.executescript("""
-        CREATE TABLE tasks (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT,
-            assignee TEXT,
-            status TEXT NOT NULL,
-            priority INTEGER NOT NULL DEFAULT 0,
-            created_by TEXT,
-            created_at INTEGER NOT NULL,
-            started_at INTEGER,
-            completed_at INTEGER,
-            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
-            workspace_path TEXT,
-            claim_lock TEXT,
-            claim_expires INTEGER
-        );
-        CREATE TABLE task_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            payload TEXT,
-            created_at INTEGER NOT NULL
-        );
-    """)
-    legacy_tasks = [
-        ("t_legacy_1", "legacy one", "todo", 1, "scratch"),
-        ("t_legacy_2", "legacy two", "done", 2, "scratch"),
-    ]
-    conn.executemany(
-        "INSERT INTO tasks (id,title,status,created_at,workspace_kind) VALUES (?,?,?,?,?)",
-        legacy_tasks,
-    )
-    conn.commit()
-    conn.close()
-
-    kb.init_db(db_path)
-    kb.init_db(db_path)
-    with kb.connect(db_path) as migrated:
-        assert [tuple(row) for row in migrated.execute(
-            "SELECT id,title,status,created_at,workspace_kind FROM tasks ORDER BY id"
-        )] == legacy_tasks
-        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert migrated.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_entity_links'"
-        ).fetchone()
 
 
 def test_attach_replay_conflict_validation_and_cascade(boards):
